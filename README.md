@@ -19,6 +19,7 @@
 
 # Apache DataFusion
 
+
 [![Crates.io][crates-badge]][crates-url]
 [![Apache licensed][license-badge]][license-url]
 [![Build Status][actions-badge]][actions-url]
