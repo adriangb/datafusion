@@ -262,9 +262,25 @@ impl FileOpener for ParquetOpener {
         let metadata = Arc::clone(&morsel.metadata);
         let access = morsel.access_plan.inner()[row_group_idx].clone();
 
-        // Determine actual split count based on row count
+        // Use the actual number of selected rows for split decisions, not the
+        // full row group size from metadata. When a morsel has already been
+        // sub-split, its Selection covers only a fraction of the row group.
+        // Using the metadata row count would cause re-splitting to produce
+        // mostly-empty sub-morsels that get re-split again, leading to a
+        // livelock where workers spin processing empty morsels.
+        let selected_rows = match &access {
+            RowGroupAccess::Skip => return vec![file],
+            RowGroupAccess::Scan => total_rows,
+            RowGroupAccess::Selection(selection) => selection
+                .iter()
+                .filter(|s| !s.skip)
+                .map(|s| s.row_count)
+                .sum(),
+        };
+
+        // Determine actual split count based on selected row count
         let n = if min_rows_per_split > 0 {
-            n.min(total_rows / min_rows_per_split).max(1)
+            n.min(selected_rows / min_rows_per_split).max(1)
         } else {
             n
         };
@@ -272,20 +288,20 @@ impl FileOpener for ParquetOpener {
             return vec![file];
         }
 
-        let rows_per_split = total_rows.div_ceil(n);
-
-        (0..n)
-            .map(|i| {
-                let start = i * rows_per_split;
-                let end = ((i + 1) * rows_per_split).min(total_rows);
-                let len = end - start;
-
-                let selection = match &access {
-                    RowGroupAccess::Skip => {
-                        unreachable!("already checked should_scan")
-                    }
-                    RowGroupAccess::Scan => {
-                        // Full scan → select only our sub-range
+        // Split the access into n sub-selections. For `Scan` we divide the
+        // row group by position; for `Selection` we split the *selected* rows
+        // evenly so that each sub-morsel gets a fair share of actual work.
+        let sub_selections = match &access {
+            RowGroupAccess::Skip => {
+                unreachable!("already checked should_scan")
+            }
+            RowGroupAccess::Scan => {
+                let rows_per_split = total_rows.div_ceil(n);
+                (0..n)
+                    .map(|i| {
+                        let start = i * rows_per_split;
+                        let end = ((i + 1) * rows_per_split).min(total_rows);
+                        let len = end - start;
                         let mut selectors = Vec::with_capacity(3);
                         if start > 0 {
                             selectors.push(RowSelector::skip(start));
@@ -296,14 +312,17 @@ impl FileOpener for ParquetOpener {
                             selectors.push(RowSelector::skip(remaining));
                         }
                         RowSelection::from(selectors)
-                    }
-                    RowGroupAccess::Selection(existing) => {
-                        // Already has a selection → take a positional sub-range
-                        // within the *selected* rows.
-                        sub_select_range(existing, start, len, total_rows)
-                    }
-                };
+                    })
+                    .collect::<Vec<_>>()
+            }
+            RowGroupAccess::Selection(existing) => {
+                split_row_selection(existing, n)
+            }
+        };
 
+        sub_selections
+            .into_iter()
+            .map(|selection| {
                 let mut sub_plan = ParquetAccessPlan::new_none(num_row_groups);
                 sub_plan.set(row_group_idx, RowGroupAccess::Selection(selection));
 
@@ -1450,6 +1469,77 @@ fn should_enable_page_index(
             .unwrap_or(false)
 }
 
+/// Split a [`RowSelection`] into `n` sub-selections, each covering roughly
+/// `selected_rows / n` selected rows. Each sub-selection covers the full
+/// row group positionally (unselected portions become skips).
+///
+/// For example, splitting `[select 100, skip 50, select 100]` into 2 gives:
+/// - Part 0: `[select 100, skip 50, skip 100]`   (100 selected rows)
+/// - Part 1: `[skip 100, skip 50, select 100]`    (100 selected rows)
+fn split_row_selection(existing: &RowSelection, n: usize) -> Vec<RowSelection> {
+    let selectors: Vec<RowSelector> = existing.iter().cloned().collect();
+    let total_selected: usize = selectors
+        .iter()
+        .filter(|s| !s.skip)
+        .map(|s| s.row_count)
+        .sum();
+
+    if n <= 1 || total_selected == 0 {
+        return vec![RowSelection::from(selectors)];
+    }
+
+    let rows_per_split = total_selected.div_ceil(n);
+
+    // For each split i, we want selected rows in the range
+    // [i * rows_per_split, min((i+1) * rows_per_split, total_selected)).
+    // We walk the selectors and determine how many of each selector's
+    // selected rows fall into the current split's range.
+    let mut results = Vec::with_capacity(n);
+
+    for split_idx in 0..n {
+        let range_start = split_idx * rows_per_split;
+        let range_end = ((split_idx + 1) * rows_per_split).min(total_selected);
+
+        let mut out = Vec::new();
+        let mut selected_seen = 0usize;
+
+        for sel in &selectors {
+            if sel.skip {
+                out.push(RowSelector::skip(sel.row_count));
+                continue;
+            }
+
+            let sel_start = selected_seen;
+            let sel_end = selected_seen + sel.row_count;
+
+            if sel_end <= range_start || sel_start >= range_end {
+                // Entirely outside our range → skip all rows
+                out.push(RowSelector::skip(sel.row_count));
+            } else {
+                // Partial or full overlap with [range_start, range_end)
+                let overlap_start = range_start.max(sel_start) - sel_start;
+                let overlap_end = range_end.min(sel_end) - sel_start;
+                let overlap_count = overlap_end - overlap_start;
+
+                if overlap_start > 0 {
+                    out.push(RowSelector::skip(overlap_start));
+                }
+                out.push(RowSelector::select(overlap_count));
+                let after = sel.row_count - overlap_end;
+                if after > 0 {
+                    out.push(RowSelector::skip(after));
+                }
+            }
+
+            selected_seen = sel_end;
+        }
+
+        results.push(RowSelection::from(out));
+    }
+
+    results
+}
+
 /// Given an existing `RowSelection` that covers `total_rows` in a row group,
 /// produce a new `RowSelection` that keeps only the rows in the positional
 /// range `[start, start+len)` within the **full** row group.
@@ -1457,6 +1547,7 @@ fn should_enable_page_index(
 /// For a `Scan` access (no existing selection), this simply selects
 /// `[start..start+len)`. For an existing `Selection`, this intersects the
 /// positional range with the existing selection.
+#[cfg(test)]
 fn sub_select_range(
     existing: &RowSelection,
     start: usize,
@@ -2649,7 +2740,7 @@ mod test {
     #[test]
     fn test_split_morsel_creates_sub_morsels() {
         use crate::ParquetAccessPlan;
-        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        use parquet::arrow::arrow_reader::RowSelector;
         use parquet::basic::{LogicalType, Type as PhysicalType};
         use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
         use parquet::schema::types::{SchemaDescriptor, Type};
@@ -2817,5 +2908,179 @@ mod test {
             1,
             "should not split when rows < min_rows_per_split"
         );
+    }
+
+    /// Regression test: re-splitting an already-split sub-morsel must not
+    /// produce mostly-empty sub-morsels. Previously, `split_morsel` used
+    /// the full row group row count from metadata instead of the actual
+    /// selected rows, causing a livelock where empty sub-morsels were
+    /// endlessly re-split.
+    #[test]
+    fn test_split_morsel_resplit_uses_selected_rows() {
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+        use parquet::schema::types::{SchemaDescriptor, Type};
+
+        // Create metadata with 1 row group of 100_000 rows
+        let field = Arc::new(
+            Type::primitive_type_builder("col", PhysicalType::INT32)
+                .with_logical_type(Some(LogicalType::Integer {
+                    bit_width: 32,
+                    is_signed: true,
+                }))
+                .build()
+                .unwrap(),
+        );
+        let schema = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![field])
+                .build()
+                .unwrap(),
+        );
+        let schema_descr = Arc::new(SchemaDescriptor::new(schema));
+
+        let column_chunk = ColumnChunkMetaData::builder(schema_descr.column(0))
+            .set_num_values(100_000)
+            .build()
+            .unwrap();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema_descr))
+            .set_num_rows(100_000)
+            .set_column_metadata(vec![column_chunk])
+            .build()
+            .unwrap();
+
+        let metadata = Arc::new(parquet::file::metadata::ParquetMetaData::new(
+            parquet::file::metadata::FileMetaData::new(
+                1,
+                100_000,
+                None,
+                None,
+                schema_descr,
+                None,
+            ),
+            vec![row_group],
+        ));
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let arrow_schema =
+            Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(store)
+            .with_schema(arrow_schema)
+            .build();
+
+        // Simulate a sub-morsel that only selects rows 0..25_000 out of 100_000
+        // (as would result from a previous split_morsel call)
+        let selection = RowSelection::from(vec![
+            RowSelector::select(25_000),
+            RowSelector::skip(75_000),
+        ]);
+        let mut access_plan = ParquetAccessPlan::new_none(1);
+        access_plan.set(0, RowGroupAccess::Selection(selection));
+        let morsel = ParquetMorsel {
+            metadata: Arc::clone(&metadata),
+            access_plan,
+        };
+
+        let mut file = PartitionedFile::new("test.parquet", 1000);
+        file.extensions = Some(Arc::new(morsel));
+
+        // Re-split with 4 partitions, min 1000 rows per sub-morsel
+        let result = opener.split_morsel(file, 4, 1000);
+        assert_eq!(result.len(), 4, "should split into 4 sub-morsels");
+
+        // Every sub-morsel should have a non-zero number of selected rows
+        for (i, f) in result.iter().enumerate() {
+            let m = f
+                .extensions
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<ParquetMorsel>()
+                .unwrap();
+            match &m.access_plan.inner()[0] {
+                RowGroupAccess::Selection(sel) => {
+                    let selected: usize = sel
+                        .iter()
+                        .filter(|s| !s.skip)
+                        .map(|s| s.row_count)
+                        .sum();
+                    assert!(
+                        selected > 0,
+                        "sub-morsel {i} has 0 selected rows — this caused a livelock"
+                    );
+                }
+                other => panic!("expected Selection, got {other:?}"),
+            }
+        }
+
+        // Also test: a sub-morsel with very few rows should not be re-split
+        let small_selection = RowSelection::from(vec![
+            RowSelector::skip(50_000),
+            RowSelector::select(100),
+            RowSelector::skip(49_900),
+        ]);
+        let mut small_access = ParquetAccessPlan::new_none(1);
+        small_access.set(0, RowGroupAccess::Selection(small_selection));
+        let small_morsel = ParquetMorsel {
+            metadata: Arc::clone(&metadata),
+            access_plan: small_access,
+        };
+        let mut small_file = PartitionedFile::new("test.parquet", 1000);
+        small_file.extensions = Some(Arc::new(small_morsel));
+
+        // With min_rows_per_split=1000, 100 selected rows should not be split
+        let result = opener.split_morsel(small_file, 4, 1000);
+        assert_eq!(
+            result.len(),
+            1,
+            "sub-morsel with fewer selected rows than min_rows_per_split should not split"
+        );
+    }
+
+    #[test]
+    fn test_split_row_selection() {
+        use super::split_row_selection;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        // Test 1: contiguous selection split evenly
+        let sel = RowSelection::from(vec![RowSelector::select(200)]);
+        let parts = split_row_selection(&sel, 4);
+        assert_eq!(parts.len(), 4);
+        for (i, part) in parts.iter().enumerate() {
+            let selected: usize = part
+                .iter()
+                .filter(|s| !s.skip)
+                .map(|s| s.row_count)
+                .sum();
+            assert_eq!(selected, 50, "part {i} should have 50 selected rows");
+        }
+
+        // Test 2: selection with gaps
+        let sel = RowSelection::from(vec![
+            RowSelector::select(100),
+            RowSelector::skip(50),
+            RowSelector::select(100),
+        ]);
+        let parts = split_row_selection(&sel, 2);
+        assert_eq!(parts.len(), 2);
+        let selected_0: usize = parts[0]
+            .iter()
+            .filter(|s| !s.skip)
+            .map(|s| s.row_count)
+            .sum();
+        let selected_1: usize = parts[1]
+            .iter()
+            .filter(|s| !s.skip)
+            .map(|s| s.row_count)
+            .sum();
+        assert_eq!(selected_0, 100);
+        assert_eq!(selected_1, 100);
+
+        // Test 3: empty selection should not be split
+        let sel = RowSelection::from(vec![RowSelector::skip(1000)]);
+        let parts = split_row_selection(&sel, 4);
+        assert_eq!(parts.len(), 1, "empty selection should not be split");
     }
 }
