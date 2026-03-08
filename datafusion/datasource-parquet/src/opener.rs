@@ -20,7 +20,7 @@
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
 use crate::{
-    ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
+    ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory, RowGroupAccess,
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
@@ -61,7 +61,8 @@ use futures::{Stream, StreamExt, TryStreamExt, ready};
 use log::debug;
 use parquet::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, RowSelectionPolicy,
+    ArrowReaderMetadata, ArrowReaderOptions, RowSelection, RowSelectionPolicy,
+    RowSelector,
 };
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
@@ -138,7 +139,7 @@ pub(crate) struct PreparedAccessPlan {
     /// Row group indexes to read
     pub(crate) row_group_indexes: Vec<usize>,
     /// Optional row selection for filtering within row groups
-    pub(crate) row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
+    pub(crate) row_selection: Option<RowSelection>,
 }
 
 struct RowGroupStatisticsPruningContext<'a> {
@@ -234,6 +235,87 @@ impl FileOpener for ParquetOpener {
             .as_ref()
             .map(|e| e.is::<ParquetMorsel>())
             .unwrap_or(false)
+    }
+
+    fn split_morsel(
+        &self,
+        file: PartitionedFile,
+        n: usize,
+        min_rows_per_split: usize,
+    ) -> Vec<PartitionedFile> {
+        // Extract morsel info upfront to avoid borrow conflicts with `file`.
+        let Some(morsel) = file
+            .extensions
+            .as_ref()
+            .and_then(|e| e.downcast_ref::<ParquetMorsel>())
+        else {
+            return vec![file];
+        };
+        let row_group_indexes: Vec<usize> =
+            morsel.access_plan.row_group_index_iter().collect();
+        let row_group_idx = match row_group_indexes.first() {
+            Some(&idx) => idx,
+            None => return vec![file],
+        };
+        let total_rows = morsel.metadata.row_groups()[row_group_idx].num_rows() as usize;
+        let num_row_groups = morsel.metadata.num_row_groups();
+        let metadata = Arc::clone(&morsel.metadata);
+        let access = morsel.access_plan.inner()[row_group_idx].clone();
+
+        // Determine actual split count based on row count
+        let n = if min_rows_per_split > 0 {
+            n.min(total_rows / min_rows_per_split).max(1)
+        } else {
+            n
+        };
+        if n <= 1 {
+            return vec![file];
+        }
+
+        let rows_per_split = total_rows.div_ceil(n);
+
+        (0..n)
+            .map(|i| {
+                let start = i * rows_per_split;
+                let end = ((i + 1) * rows_per_split).min(total_rows);
+                let len = end - start;
+
+                let selection = match &access {
+                    RowGroupAccess::Skip => {
+                        unreachable!("already checked should_scan")
+                    }
+                    RowGroupAccess::Scan => {
+                        // Full scan → select only our sub-range
+                        let mut selectors = Vec::with_capacity(3);
+                        if start > 0 {
+                            selectors.push(RowSelector::skip(start));
+                        }
+                        selectors.push(RowSelector::select(len));
+                        let remaining = total_rows - end;
+                        if remaining > 0 {
+                            selectors.push(RowSelector::skip(remaining));
+                        }
+                        RowSelection::from(selectors)
+                    }
+                    RowGroupAccess::Selection(existing) => {
+                        // Already has a selection → take a positional sub-range
+                        // within the *selected* rows.
+                        sub_select_range(existing, start, len, total_rows)
+                    }
+                };
+
+                let mut sub_plan = ParquetAccessPlan::new_none(num_row_groups);
+                sub_plan.set(row_group_idx, RowGroupAccess::Selection(selection));
+
+                let sub_morsel = ParquetMorsel {
+                    metadata: Arc::clone(&metadata),
+                    access_plan: sub_plan,
+                };
+                let mut f = file.clone();
+                f.extensions = Some(Arc::new(sub_morsel));
+                f
+            })
+            .collect()
     }
 
     fn morselize(
@@ -1368,6 +1450,33 @@ fn should_enable_page_index(
             .unwrap_or(false)
 }
 
+/// Given an existing `RowSelection` that covers `total_rows` in a row group,
+/// produce a new `RowSelection` that keeps only the rows in the positional
+/// range `[start, start+len)` within the **full** row group.
+///
+/// For a `Scan` access (no existing selection), this simply selects
+/// `[start..start+len)`. For an existing `Selection`, this intersects the
+/// positional range with the existing selection.
+fn sub_select_range(
+    existing: &RowSelection,
+    start: usize,
+    len: usize,
+    total_rows: usize,
+) -> RowSelection {
+    // Build a range selection: skip `start`, select `len`, skip rest
+    let mut selectors = Vec::with_capacity(3);
+    if start > 0 {
+        selectors.push(RowSelector::skip(start));
+    }
+    selectors.push(RowSelector::select(len));
+    let remaining = total_rows - (start + len);
+    if remaining > 0 {
+        selectors.push(RowSelector::skip(remaining));
+    }
+    let range_sel = RowSelection::from(selectors);
+    existing.intersection(&range_sel)
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
@@ -2486,5 +2595,227 @@ mod test {
                 "row_groups_pruned_bloom_filter should be equivalent for open vs morselize path (enable_row_group_stats_pruning={enable_row_group_stats_pruning})"
             );
         }
+    }
+
+    #[test]
+    fn test_sub_select_range_full_scan() {
+        use super::sub_select_range;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        // existing selection: select all 1000 rows
+        let existing = RowSelection::from(vec![RowSelector::select(1000)]);
+
+        // sub-range: rows 200-500
+        let result = sub_select_range(&existing, 200, 300, 1000);
+        let selectors: Vec<RowSelector> = result.into();
+
+        // Verify total row counts
+        let total: usize = selectors.iter().map(|s| s.row_count).sum();
+        let selected: usize = selectors
+            .iter()
+            .filter(|s| !s.skip)
+            .map(|s| s.row_count)
+            .sum();
+        assert_eq!(total, 1000);
+        assert_eq!(selected, 300);
+    }
+
+    #[test]
+    fn test_sub_select_range_with_existing_selection() {
+        use super::sub_select_range;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+
+        // existing selection: skip 100, select 200, skip 700
+        let existing = RowSelection::from(vec![
+            RowSelector::skip(100),
+            RowSelector::select(200),
+            RowSelector::skip(700),
+        ]);
+
+        // sub-range: rows 0-500 (should intersect with the existing selection)
+        let result = sub_select_range(&existing, 0, 500, 1000);
+        let selectors: Vec<RowSelector> = result.into();
+
+        // The intersection of [skip 100, select 200, skip 700] and [select 500, skip 500]
+        // = skip 100, select 200, skip 200, skip 500 = skip 100, select 200, skip 700
+        let selected: usize = selectors
+            .iter()
+            .filter(|s| !s.skip)
+            .map(|s| s.row_count)
+            .sum();
+        assert_eq!(selected, 200);
+    }
+
+    #[test]
+    fn test_split_morsel_creates_sub_morsels() {
+        use crate::ParquetAccessPlan;
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+        use parquet::schema::types::{SchemaDescriptor, Type};
+
+        // Create minimal parquet metadata with 1 row group of 10000 rows
+        let field = Arc::new(
+            Type::primitive_type_builder("col", PhysicalType::INT32)
+                .with_logical_type(Some(LogicalType::Integer {
+                    bit_width: 32,
+                    is_signed: true,
+                }))
+                .build()
+                .unwrap(),
+        );
+        let schema = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![field])
+                .build()
+                .unwrap(),
+        );
+        let schema_descr = Arc::new(SchemaDescriptor::new(schema));
+
+        let column_chunk = ColumnChunkMetaData::builder(schema_descr.column(0))
+            .set_num_values(10000)
+            .build()
+            .unwrap();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema_descr))
+            .set_num_rows(10000)
+            .set_column_metadata(vec![column_chunk])
+            .build()
+            .unwrap();
+
+        let metadata = Arc::new(parquet::file::metadata::ParquetMetaData::new(
+            parquet::file::metadata::FileMetaData::new(
+                1,
+                10000,
+                None,
+                None,
+                schema_descr,
+                None,
+            ),
+            vec![row_group],
+        ));
+
+        let mut access_plan = ParquetAccessPlan::new_none(1);
+        access_plan.set(0, RowGroupAccess::Scan);
+        let morsel = ParquetMorsel {
+            metadata: Arc::clone(&metadata),
+            access_plan,
+        };
+
+        let mut file = PartitionedFile::new("test.parquet", 1000);
+        file.extensions = Some(Arc::new(morsel));
+
+        // Build a minimal opener for the test
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let arrow_schema =
+            Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(store)
+            .with_schema(arrow_schema)
+            .build();
+
+        // Split into 4 sub-morsels with min 1000 rows each
+        let result = opener.split_morsel(file, 4, 1000);
+        assert_eq!(result.len(), 4);
+
+        // Verify each sub-morsel has a RowSelection covering its sub-range
+        for (i, f) in result.iter().enumerate() {
+            let m = f
+                .extensions
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<ParquetMorsel>()
+                .unwrap();
+            assert_eq!(m.access_plan.row_group_index_iter().count(), 1);
+
+            match &m.access_plan.inner()[0] {
+                RowGroupAccess::Selection(sel) => {
+                    let selectors: Vec<RowSelector> = sel.clone().into();
+                    let total: usize = selectors.iter().map(|s| s.row_count).sum();
+                    assert_eq!(total, 10000);
+                    let selected: usize = selectors
+                        .iter()
+                        .filter(|s| !s.skip)
+                        .map(|s| s.row_count)
+                        .sum();
+                    assert_eq!(selected, 2500, "sub-morsel {i} has wrong row count");
+                }
+                other => panic!("expected Selection, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_morsel_respects_min_rows() {
+        use crate::ParquetAccessPlan;
+        use parquet::basic::{LogicalType, Type as PhysicalType};
+        use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+        use parquet::schema::types::{SchemaDescriptor, Type};
+
+        // Create metadata with 1 row group of 100 rows
+        let field = Arc::new(
+            Type::primitive_type_builder("col", PhysicalType::INT32)
+                .with_logical_type(Some(LogicalType::Integer {
+                    bit_width: 32,
+                    is_signed: true,
+                }))
+                .build()
+                .unwrap(),
+        );
+        let schema = Arc::new(
+            Type::group_type_builder("schema")
+                .with_fields(vec![field])
+                .build()
+                .unwrap(),
+        );
+        let schema_descr = Arc::new(SchemaDescriptor::new(schema));
+
+        let column_chunk = ColumnChunkMetaData::builder(schema_descr.column(0))
+            .set_num_values(100)
+            .build()
+            .unwrap();
+        let row_group = RowGroupMetaData::builder(Arc::clone(&schema_descr))
+            .set_num_rows(100)
+            .set_column_metadata(vec![column_chunk])
+            .build()
+            .unwrap();
+
+        let metadata = Arc::new(parquet::file::metadata::ParquetMetaData::new(
+            parquet::file::metadata::FileMetaData::new(
+                1,
+                100,
+                None,
+                None,
+                schema_descr,
+                None,
+            ),
+            vec![row_group],
+        ));
+
+        let mut access_plan = ParquetAccessPlan::new_none(1);
+        access_plan.set(0, RowGroupAccess::Scan);
+        let morsel = ParquetMorsel {
+            metadata: Arc::clone(&metadata),
+            access_plan,
+        };
+
+        let mut file = PartitionedFile::new("test.parquet", 1000);
+        file.extensions = Some(Arc::new(morsel));
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let arrow_schema =
+            Arc::new(Schema::new(vec![Field::new("col", DataType::Int32, false)]));
+        let opener = ParquetOpenerBuilder::new()
+            .with_store(store)
+            .with_schema(arrow_schema)
+            .build();
+
+        // Try to split into 16 sub-morsels with min 8192 rows each.
+        // Since 100 / 8192 = 0, should not split.
+        let result = opener.split_morsel(file, 16, 8192);
+        assert_eq!(
+            result.len(),
+            1,
+            "should not split when rows < min_rows_per_split"
+        );
     }
 }
