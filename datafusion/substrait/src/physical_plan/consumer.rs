@@ -47,7 +47,7 @@ use substrait::proto::{
 /// Convert Substrait Rel to DataFusion ExecutionPlan
 #[async_recursion]
 pub async fn from_substrait_rel(
-    _ctx: &SessionContext,
+    ctx: &SessionContext,
     rel: &Rel,
     _extensions: &HashMap<u32, &String>,
 ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -135,7 +135,7 @@ pub async fn from_substrait_rel(
                         file_groups[part_index].push(partitioned_file)
                     }
 
-                    let morsel_driven = _ctx
+                    let morsel_driven = ctx
                         .state()
                         .config()
                         .options()
