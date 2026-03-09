@@ -546,7 +546,7 @@ impl WorkQueue {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
                     let sub_morsels = opener.split_morsel(
                         morsel,
-                        usize::MAX,
+                        self.num_partitions * 2,
                         0,
                     );
                     if sub_morsels.len() > 1 {

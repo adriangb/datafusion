@@ -136,10 +136,6 @@ pub(super) struct ParquetOpener {
     /// aggregation). When true, morsels are eagerly split into sub-morsels
     /// so the filter tightens faster.
     pub has_tightening_filter: bool,
-    /// Maximum number of sub-morsels to create when splitting a row group.
-    /// Typically set to `num_partitions * 2` to provide good load balancing
-    /// without excessive RowSelection overhead.
-    pub max_sub_morsels: usize,
 }
 
 /// A morsel of work for Parquet execution, containing cached metadata and an access plan.
@@ -259,7 +255,7 @@ impl FileOpener for ParquetOpener {
     fn split_morsel(
         &self,
         file: PartitionedFile,
-        _n: usize,
+        n: usize,
         _min_rows_per_split: usize,
     ) -> Vec<PartitionedFile> {
         let Some(morsel) = file
@@ -308,7 +304,7 @@ impl FileOpener for ParquetOpener {
 
         let n_splits = (selected_bytes / TARGET_BYTES_PER_SUB_MORSEL)
             .max(1)
-            .min(self.max_sub_morsels);
+            .min(n);
         if n_splits <= 1 {
             return vec![file];
         }
@@ -378,7 +374,6 @@ impl FileOpener for ParquetOpener {
         let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
         let partition_index = self.partition_index;
         let has_tightening_filter = self.has_tightening_filter;
-        let max_sub_morsels = self.max_sub_morsels;
         let projection_column_indices = self.projection.column_indices();
 
         Box::pin(async move {
@@ -613,7 +608,6 @@ impl FileOpener for ParquetOpener {
                             };
                             (selected_bytes / TARGET_BYTES_PER_SUB_MORSEL)
                                 .max(1)
-                                .min(max_sub_morsels)
                         })
                         .unwrap_or(1);
                     if n_splits > 1 {
@@ -1887,7 +1881,6 @@ mod test {
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
                 has_tightening_filter: false,
-                max_sub_morsels: 8,
             }
         }
     }

@@ -595,10 +595,6 @@ impl FileSource for ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             has_tightening_filter,
-            max_sub_morsels: std::thread::available_parallelism()
-                .map(|p| p.get())
-                .unwrap_or(1)
-                * 2,
         });
         Ok(opener)
     }

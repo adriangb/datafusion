@@ -365,7 +365,7 @@ impl ExecutionPlan for DataSourceExec {
             let source = config.file_source.with_batch_size(batch_size);
             let opener_for_queue =
                 source.create_file_opener(object_store, config, partition)?;
-            let num_partitions = config.file_groups.len();
+            let num_partitions = context.session_config().target_partitions();
             let queue = context.get_or_insert_shared_state(key, || {
                 let all_files = config
                     .file_groups
