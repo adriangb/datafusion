@@ -1166,10 +1166,7 @@ impl AggregateExec {
 
         if !aggr_dyn_filters.is_empty() {
             self.dynamic_filter = Some(Arc::new(AggrDynFilter {
-                filter: Arc::new(
-                    DynamicFilterPhysicalExpr::new(all_cols, lit(true))
-                        .with_tightening(true),
-                ),
+                filter: Arc::new(DynamicFilterPhysicalExpr::new(all_cols, lit(true))),
                 supported_accumulators_info: aggr_dyn_filters,
             }))
         }
