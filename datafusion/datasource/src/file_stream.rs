@@ -516,31 +516,35 @@ impl WorkQueue {
     pub fn pull(&self) -> WorkStatus {
         // First try the morsel queue — these are ready to open immediately
         // and preserve locality with the file that was just morselized.
-        let (morsel, should_split) = {
+        let (morsel, split_into) = {
             let mut morsels = self.morsels.lock().unwrap();
             match morsels.pop_front() {
                 Some(morsel) => {
                     let remaining = morsels.len();
                     let files_remaining = self.files.lock().unwrap().len();
                     let total = remaining + files_remaining;
-                    let should_split = total < self.num_partitions;
+                    let split_into = if total < self.num_partitions {
+                        self.num_partitions - total
+                    } else {
+                        0
+                    };
                     // When we're about to split, increment morselizing_count
                     // to prevent other workers from seeing an empty system
                     // and returning Done while sub-morsels are in flight.
-                    if should_split {
+                    if split_into > 1 {
                         self.morselizing_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    (Some(morsel), should_split)
+                    (Some(morsel), split_into)
                 }
-                None => (None, false),
+                None => (None, 0),
             }
         };
 
         if let Some(morsel) = morsel {
-            if should_split {
+            if split_into > 1 {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels =
-                        opener.split_morsel(morsel, 2, MIN_ROWS_PER_SUB_MORSEL);
+                    let sub_morsels = opener
+                        .split_morsel(morsel, split_into, MIN_ROWS_PER_SUB_MORSEL);
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
                         let first = iter.next().unwrap();

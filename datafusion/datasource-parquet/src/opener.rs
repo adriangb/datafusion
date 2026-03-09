@@ -132,6 +132,9 @@ pub struct ParquetMorsel {
     pub metadata: Arc<ParquetMetaData>,
     /// Access plan for this morsel (usually selecting a single row group)
     pub access_plan: ParquetAccessPlan,
+    /// Whether this morsel was produced by sub-splitting another morsel.
+    /// Sub-morsels are not split further to avoid cascading splits.
+    pub is_sub_morsel: bool,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -251,6 +254,10 @@ impl FileOpener for ParquetOpener {
         else {
             return vec![file];
         };
+        // Don't re-split sub-morsels to avoid cascading splits.
+        if morsel.is_sub_morsel {
+            return vec![file];
+        }
         let row_group_indexes: Vec<usize> =
             morsel.access_plan.row_group_index_iter().collect();
         let row_group_idx = match row_group_indexes.first() {
@@ -327,6 +334,7 @@ impl FileOpener for ParquetOpener {
                 let sub_morsel = ParquetMorsel {
                     metadata: Arc::clone(&metadata),
                     access_plan: sub_plan,
+                    is_sub_morsel: true,
                 };
                 let mut f = file.clone();
                 f.extensions = Some(Arc::new(sub_morsel));
@@ -573,6 +581,7 @@ impl FileOpener for ParquetOpener {
                 let morsel = ParquetMorsel {
                     metadata: Arc::clone(&metadata),
                     access_plan: morsel_access_plan,
+                    is_sub_morsel: false,
                 };
                 let mut f = partitioned_file.clone();
                 f.extensions = Some(Arc::new(morsel));
@@ -2788,6 +2797,7 @@ mod test {
         let morsel = ParquetMorsel {
             metadata: Arc::clone(&metadata),
             access_plan,
+            is_sub_morsel: false,
         };
 
         let mut file = PartitionedFile::new("test.parquet", 1000);
@@ -2885,6 +2895,7 @@ mod test {
         let morsel = ParquetMorsel {
             metadata: Arc::clone(&metadata),
             access_plan,
+            is_sub_morsel: false,
         };
 
         let mut file = PartitionedFile::new("test.parquet", 1000);
@@ -2980,6 +2991,7 @@ mod test {
         let morsel = ParquetMorsel {
             metadata: Arc::clone(&metadata),
             access_plan,
+            is_sub_morsel: false,
         };
 
         let mut file = PartitionedFile::new("test.parquet", 1000);
@@ -3021,6 +3033,7 @@ mod test {
         let small_morsel = ParquetMorsel {
             metadata: Arc::clone(&metadata),
             access_plan: small_access,
+            is_sub_morsel: false,
         };
         let mut small_file = PartitionedFile::new("test.parquet", 1000);
         small_file.extensions = Some(Arc::new(small_morsel));
@@ -3032,6 +3045,23 @@ mod test {
             1,
             "sub-morsel with fewer selected rows than min_rows_per_split should not split"
         );
+
+        // Sub-morsels (is_sub_morsel=true) should never be re-split
+        let selection = RowSelection::from(vec![
+            RowSelector::select(25_000),
+            RowSelector::skip(75_000),
+        ]);
+        let mut access_plan = ParquetAccessPlan::new_none(1);
+        access_plan.set(0, RowGroupAccess::Selection(selection));
+        let morsel = ParquetMorsel {
+            metadata: Arc::clone(&metadata),
+            access_plan,
+            is_sub_morsel: true,
+        };
+        let mut file = PartitionedFile::new("test.parquet", 1000);
+        file.extensions = Some(Arc::new(morsel));
+        let result = opener.split_morsel(file, 4, 1000);
+        assert_eq!(result.len(), 1, "sub-morsels should not be re-split");
     }
 
     #[test]
