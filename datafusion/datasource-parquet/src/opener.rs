@@ -315,9 +315,7 @@ impl FileOpener for ParquetOpener {
                     })
                     .collect::<Vec<_>>()
             }
-            RowGroupAccess::Selection(existing) => {
-                split_row_selection(existing, n)
-            }
+            RowGroupAccess::Selection(existing) => split_row_selection(existing, n),
         };
 
         sub_selections
@@ -3001,11 +2999,8 @@ mod test {
                 .unwrap();
             match &m.access_plan.inner()[0] {
                 RowGroupAccess::Selection(sel) => {
-                    let selected: usize = sel
-                        .iter()
-                        .filter(|s| !s.skip)
-                        .map(|s| s.row_count)
-                        .sum();
+                    let selected: usize =
+                        sel.iter().filter(|s| !s.skip).map(|s| s.row_count).sum();
                     assert!(
                         selected > 0,
                         "sub-morsel {i} has 0 selected rows — this caused a livelock"
@@ -3049,11 +3044,8 @@ mod test {
         let parts = split_row_selection(&sel, 4);
         assert_eq!(parts.len(), 4);
         for (i, part) in parts.iter().enumerate() {
-            let selected: usize = part
-                .iter()
-                .filter(|s| !s.skip)
-                .map(|s| s.row_count)
-                .sum();
+            let selected: usize =
+                part.iter().filter(|s| !s.skip).map(|s| s.row_count).sum();
             assert_eq!(selected, 50, "part {i} should have 50 selected rows");
         }
 

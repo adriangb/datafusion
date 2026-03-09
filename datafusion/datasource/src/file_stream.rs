@@ -523,7 +523,14 @@ impl WorkQueue {
                     let remaining = morsels.len();
                     let files_remaining = self.files.lock().unwrap().len();
                     let total = remaining + files_remaining;
-                    (Some(morsel), total < self.num_partitions)
+                    let should_split = total < self.num_partitions;
+                    // When we're about to split, increment morselizing_count
+                    // to prevent other workers from seeing an empty system
+                    // and returning Done while sub-morsels are in flight.
+                    if should_split {
+                        self.morselizing_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                    (Some(morsel), should_split)
                 }
                 None => (None, false),
             }
@@ -531,26 +538,26 @@ impl WorkQueue {
 
         if let Some(morsel) = morsel {
             if should_split {
-                if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels = opener.split_morsel(
-                        morsel,
-                        2,
-                        MIN_ROWS_PER_SUB_MORSEL,
-                    );
+                let result = if let Some(opener) = self.file_opener.as_ref() {
+                    let sub_morsels =
+                        opener.split_morsel(morsel, 2, MIN_ROWS_PER_SUB_MORSEL);
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
                         let first = iter.next().unwrap();
                         // Push the rest back for other workers
                         let rest: Vec<_> = iter.collect();
                         self.push_morsels(rest);
-                        return WorkStatus::Work(Box::new(first));
+                        first
                     } else {
-                        // split returned 1 or 0 — return as-is
-                        return WorkStatus::Work(Box::new(
-                            sub_morsels.into_iter().next().unwrap(),
-                        ));
+                        sub_morsels.into_iter().next().unwrap()
                     }
-                }
+                } else {
+                    morsel
+                };
+                // Release the split guard — sub-morsels (if any) are now
+                // visible in the queue via push_morsels above.
+                self.stop_morselizing();
+                return WorkStatus::Work(Box::new(result));
             }
             return WorkStatus::Work(Box::new(morsel));
         }
