@@ -132,10 +132,6 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
-    /// Whether the query has a tightening dynamic filter (e.g. TopK,
-    /// aggregation). When true, morsels are eagerly split into sub-morsels
-    /// so the filter tightens faster.
-    pub has_tightening_filter: bool,
 }
 
 /// A morsel of work for Parquet execution, containing cached metadata and an access plan.
@@ -392,7 +388,6 @@ impl FileOpener for ParquetOpener {
         let preserve_order = self.preserve_order;
         let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
         let partition_index = self.partition_index;
-        let has_tightening_filter = self.has_tightening_filter;
         let projection_column_indices = self.projection.column_indices();
 
         Box::pin(async move {
@@ -572,10 +567,6 @@ impl FileOpener for ParquetOpener {
             // projected compressed bytes. Small row groups are combined into
             // a single morsel to reduce per-morsel overhead (reader creation,
             // queue coordination). Large row groups get their own morsel.
-            //
-            // When a tightening filter is present, skip grouping so each row
-            // group stays as its own morsel — the eager sub-splitting below
-            // only handles single-row-group morsels.
             let mut morsels = Vec::with_capacity(access_plan.len());
             let mut current_plan: Option<ParquetAccessPlan> = None;
             let mut current_bytes: usize = 0;
@@ -588,8 +579,8 @@ impl FileOpener for ParquetOpener {
                 let rg_bytes =
                     projected_compressed_size(rg, &projection_column_indices);
 
-                let should_group = !has_tightening_filter
-                    && current_bytes + rg_bytes <= TARGET_BYTES_PER_SUB_MORSEL;
+                let should_group =
+                    current_bytes + rg_bytes <= TARGET_BYTES_PER_SUB_MORSEL;
 
                 if let Some(ref mut plan) = current_plan {
                     if should_group {
@@ -630,72 +621,6 @@ impl FileOpener for ParquetOpener {
                 let mut f = partitioned_file.clone();
                 f.extensions = Some(Arc::new(morsel));
                 morsels.push(f);
-            }
-
-            // When a tightening dynamic filter is present (TopK, aggregation),
-            // eagerly split large morsels into sub-morsels so the filter
-            // tightens faster — each completed sub-morsel improves the filter,
-            // allowing subsequent sub-morsels to skip more data.
-            //
-            // Splitting is based on projected compressed bytes rather than row
-            // count, so narrow scans (few columns) avoid unnecessary splits
-            // while wide scans get fine-grained parallelism.
-            if has_tightening_filter {
-                let mut split_morsels = Vec::with_capacity(morsels.len());
-                for morsel_file in morsels {
-                    let morsel = morsel_file
-                        .extensions
-                        .as_ref()
-                        .and_then(|e| e.downcast_ref::<ParquetMorsel>());
-                    let rg_idx = morsel
-                        .and_then(|m| m.access_plan.row_group_index_iter().next());
-                    let n_splits = rg_idx
-                        .map(|idx| {
-                            let rg = &metadata.row_groups()[idx];
-                            let total_rows = rg.num_rows() as usize;
-                            let projected_bytes = projected_compressed_size(
-                                rg,
-                                &projection_column_indices,
-                            );
-                            let access = &access_plan.inner()[idx];
-                            let selected_rows = match access {
-                                RowGroupAccess::Skip => 0,
-                                RowGroupAccess::Scan => total_rows,
-                                RowGroupAccess::Selection(sel) => sel
-                                    .iter()
-                                    .filter(|s| !s.skip)
-                                    .map(|s| s.row_count)
-                                    .sum(),
-                            };
-                            let selected_bytes = if total_rows > 0 {
-                                projected_bytes * selected_rows / total_rows
-                            } else {
-                                0
-                            };
-                            (selected_bytes / TARGET_BYTES_PER_SUB_MORSEL)
-                                .max(1)
-                        })
-                        .unwrap_or(1);
-                    if n_splits > 1 {
-                        let rg_idx = rg_idx.unwrap();
-                        let rg = &metadata.row_groups()[rg_idx];
-                        let total_rows = rg.num_rows() as usize;
-                        let access = &access_plan.inner()[rg_idx];
-                        let subs = split_into_sub_morsels(
-                            &morsel_file,
-                            access,
-                            total_rows,
-                            n_splits,
-                            rg_idx,
-                            num_row_groups,
-                            &metadata,
-                        );
-                        split_morsels.extend(subs);
-                    } else {
-                        split_morsels.push(morsel_file);
-                    }
-                }
-                morsels = split_morsels;
             }
 
             Ok(morsels)
@@ -1946,7 +1871,6 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
-                has_tightening_filter: false,
             }
         }
     }
