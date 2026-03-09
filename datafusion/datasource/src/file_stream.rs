@@ -448,15 +448,6 @@ pub enum WorkStatus {
     Done,
 }
 
-/// Target number of rows per sub-morsel when splitting.
-///
-/// Controls the granularity of sub-morsel splitting: row groups larger
-/// than this are split into chunks of approximately this size. Row
-/// groups smaller than this are not split at all. This provides
-/// self-regulating behavior — small row groups avoid overhead while
-/// large ones get fine-grained parallelism.
-const TARGET_ROWS_PER_SUB_MORSEL: usize = 100_000;
-
 /// A shared queue of [`PartitionedFile`] morsels for morsel-driven execution.
 ///
 /// Internally keeps two queues: one for whole files that still need
@@ -464,10 +455,6 @@ const TARGET_ROWS_PER_SUB_MORSEL: usize = 100_000;
 /// groups). Workers drain the morsel queue first, which keeps I/O
 /// sequential within a file because freshly produced morsels are
 /// consumed before the next file is opened.
-///
-/// When the queue depth is low (morsel count <= `num_partitions`), the
-/// queue will attempt to split morsels into sub-morsels using the
-/// [`FileOpener::split_morsel`] method to improve parallelism.
 pub struct WorkQueue {
     /// Whole files waiting to be morselized.
     files: Mutex<VecDeque<PartitionedFile>>,
@@ -477,10 +464,6 @@ pub struct WorkQueue {
     morselizing_count: AtomicUsize,
     /// Notify waiters when work is added or morselizing finishes.
     notify: Notify,
-    /// Number of execution partitions (workers). Used to decide when to split.
-    num_partitions: usize,
-    /// File opener used to split morsels into sub-morsels.
-    file_opener: Option<Arc<dyn FileOpener>>,
 }
 
 impl std::fmt::Debug for WorkQueue {
@@ -489,25 +472,18 @@ impl std::fmt::Debug for WorkQueue {
             .field("files", &self.files)
             .field("morsels", &self.morsels)
             .field("morselizing_count", &self.morselizing_count)
-            .field("num_partitions", &self.num_partitions)
             .finish()
     }
 }
 
 impl WorkQueue {
     /// Create a new `WorkQueue` with the given initial files.
-    pub fn new(
-        initial_files: Vec<PartitionedFile>,
-        num_partitions: usize,
-        file_opener: Option<Arc<dyn FileOpener>>,
-    ) -> Self {
+    pub fn new(initial_files: Vec<PartitionedFile>) -> Self {
         Self {
             files: Mutex::new(VecDeque::from(initial_files)),
             morsels: Mutex::new(VecDeque::new()),
             morselizing_count: AtomicUsize::new(0),
             notify: Notify::new(),
-            num_partitions,
-            file_opener,
         }
     }
 
@@ -515,66 +491,10 @@ impl WorkQueue {
     ///
     /// Prefers already-morselized morsels (for I/O locality) over whole
     /// files that still need morselizing.
-    ///
-    /// When there are fewer morsels than workers, splits the pulled morsel
-    /// into sub-morsels to keep all workers busy.
     pub fn pull(&self) -> WorkStatus {
         // First try the morsel queue — these are ready to open immediately
         // and preserve locality with the file that was just morselized.
-        let (morsel, should_split) = {
-            let mut morsels = self.morsels.lock().unwrap();
-            match morsels.pop_front() {
-                Some(morsel) => {
-                    let remaining = morsels.len();
-                    let files_remaining = self.files.lock().unwrap().len();
-                    let total = remaining + files_remaining;
-                    // Split when there aren't enough morsels for all
-                    // workers and no more are coming. Each morsel is
-                    // split into ~TARGET_ROWS_PER_SUB_MORSEL-row pieces,
-                    // which keeps all workers busy while remaining large
-                    // enough to amortise per-morsel overhead. Small row
-                    // groups (< TARGET_ROWS_PER_SUB_MORSEL) are never split.
-                    let should_split = total < self.num_partitions
-                        && files_remaining == 0
-                        && self.morselizing_count.load(Ordering::Relaxed) == 0;
-                    // When we're about to split, increment morselizing_count
-                    // to prevent other workers from seeing an empty system
-                    // and returning Done while sub-morsels are in flight.
-                    if should_split {
-                        self.morselizing_count.fetch_add(1, Ordering::Relaxed);
-                    }
-                    (Some(morsel), should_split)
-                }
-                None => (None, false),
-            }
-        };
-
-        if let Some(morsel) = morsel {
-            if should_split {
-                let result = if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels = opener.split_morsel(
-                        morsel,
-                        usize::MAX,
-                        TARGET_ROWS_PER_SUB_MORSEL,
-                    );
-                    if sub_morsels.len() > 1 {
-                        let mut iter = sub_morsels.into_iter();
-                        let first = iter.next().unwrap();
-                        // Push the rest back for other workers
-                        let rest: Vec<_> = iter.collect();
-                        self.push_morsels(rest);
-                        first
-                    } else {
-                        sub_morsels.into_iter().next().unwrap()
-                    }
-                } else {
-                    morsel
-                };
-                // Release the split guard — sub-morsels (if any) are now
-                // visible in the queue via push_morsels above.
-                self.stop_morselizing();
-                return WorkStatus::Work(Box::new(result));
-            }
+        if let Some(morsel) = self.morsels.lock().unwrap().pop_front() {
             return WorkStatus::Work(Box::new(morsel));
         }
 
@@ -691,23 +611,6 @@ pub trait FileOpener: Unpin + Send + Sync {
     /// morselize).
     fn is_leaf_morsel(&self, _file: &PartitionedFile) -> bool {
         false
-    }
-
-    /// Split a leaf morsel into `n` sub-morsels for finer-grained parallelism.
-    ///
-    /// Called by the [`WorkQueue`] when queue depth is low to avoid worker
-    /// starvation. The default implementation returns the morsel unchanged.
-    ///
-    /// Implementations should split by row ranges (e.g. using `RowSelection`)
-    /// and respect `min_rows_per_split` to avoid creating tiny morsels.
-    fn split_morsel(
-        &self,
-        file: PartitionedFile,
-        n: usize,
-        min_rows_per_split: usize,
-    ) -> Vec<PartitionedFile> {
-        let _ = (n, min_rows_per_split);
-        vec![file]
     }
 }
 

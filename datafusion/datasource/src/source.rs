@@ -356,23 +356,13 @@ impl ExecutionPlan for DataSourceExec {
 
         let (stream, queue) = if let Some(config) = morsel_config {
             let key = Arc::as_ptr(&self.data_source) as *const () as usize;
-            let object_store = context
-                .runtime_env()
-                .object_store(&config.object_store_url)?;
-            let batch_size = config
-                .batch_size
-                .unwrap_or_else(|| context.session_config().batch_size());
-            let source = config.file_source.with_batch_size(batch_size);
-            let opener_for_queue =
-                source.create_file_opener(object_store, config, partition)?;
-            let num_partitions = config.file_groups.len();
             let queue = context.get_or_insert_shared_state(key, || {
                 let all_files = config
                     .file_groups
                     .iter()
                     .flat_map(|g| g.files().iter().cloned())
                     .collect();
-                WorkQueue::new(all_files, num_partitions, Some(opener_for_queue))
+                WorkQueue::new(all_files)
             });
             let stream =
                 config.open_with_queue(partition, &context, Some(Arc::clone(&queue)))?;
