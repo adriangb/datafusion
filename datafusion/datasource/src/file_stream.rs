@@ -448,9 +448,14 @@ pub enum WorkStatus {
     Done,
 }
 
-/// Minimum number of rows per sub-morsel when splitting.
-/// Prevents creating tiny morsels where per-morsel overhead dominates.
-const MIN_ROWS_PER_SUB_MORSEL: usize = 8192;
+/// Target number of rows per sub-morsel when splitting.
+///
+/// Controls the granularity of sub-morsel splitting: row groups larger
+/// than this are split into chunks of approximately this size. Row
+/// groups smaller than this are not split at all. This provides
+/// self-regulating behavior — small row groups avoid overhead while
+/// large ones get fine-grained parallelism.
+const TARGET_ROWS_PER_SUB_MORSEL: usize = 100_000;
 
 /// A shared queue of [`PartitionedFile`] morsels for morsel-driven execution.
 ///
@@ -516,7 +521,7 @@ impl WorkQueue {
     pub fn pull(&self) -> WorkStatus {
         // First try the morsel queue — these are ready to open immediately
         // and preserve locality with the file that was just morselized.
-        let (morsel, split_into) = {
+        let (morsel, should_split) = {
             let mut morsels = self.morsels.lock().unwrap();
             match morsels.pop_front() {
                 Some(morsel) => {
@@ -530,34 +535,37 @@ impl WorkQueue {
                     // and splitting there would add overhead without
                     // benefit (e.g. TPC-H with many balanced row groups).
                     //
-                    // When we do split, split into num_partitions pieces
-                    // so every morsel at the tail gets uniformly sized
-                    // sub-morsels for photo-finish parallelism.
-                    let split_into = if total < self.num_partitions
+                    // The split count is determined by the target rows
+                    // per sub-morsel (TARGET_ROWS_PER_SUB_MORSEL), not
+                    // by num_partitions. This is self-regulating: small
+                    // row groups won't be split, large ones get enough
+                    // sub-morsels for fine-grained parallelism.
+                    let should_split = total < self.num_partitions
                         && files_remaining == 0
-                        && self.morselizing_count.load(Ordering::Relaxed) == 0
-                    {
-                        self.num_partitions
-                    } else {
-                        0
-                    };
+                        && self.morselizing_count.load(Ordering::Relaxed) == 0;
                     // When we're about to split, increment morselizing_count
                     // to prevent other workers from seeing an empty system
                     // and returning Done while sub-morsels are in flight.
-                    if split_into > 1 {
+                    if should_split {
                         self.morselizing_count.fetch_add(1, Ordering::Relaxed);
                     }
-                    (Some(morsel), split_into)
+                    (Some(morsel), should_split)
                 }
-                None => (None, 0),
+                None => (None, false),
             }
         };
 
         if let Some(morsel) = morsel {
-            if split_into > 1 {
+            if should_split {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels =
-                        opener.split_morsel(morsel, split_into, MIN_ROWS_PER_SUB_MORSEL);
+                    // Pass usize::MAX as the split count — the actual
+                    // number of sub-morsels is controlled entirely by
+                    // TARGET_ROWS_PER_SUB_MORSEL inside split_morsel.
+                    let sub_morsels = opener.split_morsel(
+                        morsel,
+                        usize::MAX,
+                        TARGET_ROWS_PER_SUB_MORSEL,
+                    );
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
                         let first = iter.next().unwrap();
