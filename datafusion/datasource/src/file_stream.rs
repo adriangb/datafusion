@@ -523,13 +523,20 @@ impl WorkQueue {
                     let remaining = morsels.len();
                     let files_remaining = self.files.lock().unwrap().len();
                     let total = remaining + files_remaining;
-                    // When queue depth is low, split into num_partitions
-                    // pieces (not just the deficit). This ensures that
-                    // *every* morsel passing through the low-queue state
-                    // gets uniformly split, giving near-perfect photo-
-                    // finish behavior where all workers end at the same
-                    // time.
-                    let split_into = if total < self.num_partitions {
+                    // Only split at the true tail of execution: when
+                    // all files have been morselized and no more morsels
+                    // are coming. During steady state the queue dips
+                    // below num_partitions between morselization bursts,
+                    // and splitting there would add overhead without
+                    // benefit (e.g. TPC-H with many balanced row groups).
+                    //
+                    // When we do split, split into num_partitions pieces
+                    // so every morsel at the tail gets uniformly sized
+                    // sub-morsels for photo-finish parallelism.
+                    let split_into = if total < self.num_partitions
+                        && files_remaining == 0
+                        && self.morselizing_count.load(Ordering::Relaxed) == 0
+                    {
                         self.num_partitions
                     } else {
                         0
