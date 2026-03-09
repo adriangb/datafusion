@@ -271,14 +271,33 @@ impl FileOpener for ParquetOpener {
         }
         let row_group_indexes: Vec<usize> =
             morsel.access_plan.row_group_index_iter().collect();
+        let num_row_groups = morsel.metadata.num_row_groups();
+        let metadata = Arc::clone(&morsel.metadata);
+
+        // Multi-row-group morsel: split into individual row group morsels
+        if row_group_indexes.len() > 1 {
+            return row_group_indexes
+                .iter()
+                .map(|&idx| {
+                    let mut plan = ParquetAccessPlan::new_none(num_row_groups);
+                    plan.set(idx, morsel.access_plan.inner()[idx].clone());
+                    let mut f = file.clone();
+                    f.extensions = Some(Arc::new(ParquetMorsel {
+                        metadata: Arc::clone(&metadata),
+                        access_plan: plan,
+                        is_sub_morsel: false,
+                    }));
+                    f
+                })
+                .collect();
+        }
+
         let row_group_idx = match row_group_indexes.first() {
             Some(&idx) => idx,
             None => return vec![file],
         };
         let rg = &morsel.metadata.row_groups()[row_group_idx];
         let total_rows = rg.num_rows() as usize;
-        let num_row_groups = morsel.metadata.num_row_groups();
-        let metadata = Arc::clone(&morsel.metadata);
         let access = morsel.access_plan.inner()[row_group_idx].clone();
 
         // Estimate projected compressed bytes for this row group
@@ -549,16 +568,63 @@ impl FileOpener for ParquetOpener {
                 );
             }
 
+            // Group adjacent scannable row groups into morsels based on
+            // projected compressed bytes. Small row groups are combined into
+            // a single morsel to reduce per-morsel overhead (reader creation,
+            // queue coordination). Large row groups get their own morsel.
+            //
+            // When a tightening filter is present, skip grouping so each row
+            // group stays as its own morsel — the eager sub-splitting below
+            // only handles single-row-group morsels.
             let mut morsels = Vec::with_capacity(access_plan.len());
+            let mut current_plan: Option<ParquetAccessPlan> = None;
+            let mut current_bytes: usize = 0;
+
             for i in 0..num_row_groups {
                 if !access_plan.should_scan(i) {
                     continue;
                 }
-                let mut morsel_access_plan = ParquetAccessPlan::new_none(num_row_groups);
-                morsel_access_plan.set(i, access_plan.inner()[i].clone());
+                let rg = &metadata.row_groups()[i];
+                let rg_bytes =
+                    projected_compressed_size(rg, &projection_column_indices);
+
+                let should_group = !has_tightening_filter
+                    && current_bytes + rg_bytes <= TARGET_BYTES_PER_SUB_MORSEL;
+
+                if let Some(ref mut plan) = current_plan {
+                    if should_group {
+                        plan.set(i, access_plan.inner()[i].clone());
+                        current_bytes += rg_bytes;
+                    } else {
+                        // Flush current morsel
+                        let morsel = ParquetMorsel {
+                            metadata: Arc::clone(&metadata),
+                            access_plan: plan.clone(),
+                            is_sub_morsel: false,
+                        };
+                        let mut f = partitioned_file.clone();
+                        f.extensions = Some(Arc::new(morsel));
+                        morsels.push(f);
+                        // Start new morsel with this row group
+                        let mut new_plan =
+                            ParquetAccessPlan::new_none(num_row_groups);
+                        new_plan.set(i, access_plan.inner()[i].clone());
+                        *plan = new_plan;
+                        current_bytes = rg_bytes;
+                    }
+                } else {
+                    let mut plan =
+                        ParquetAccessPlan::new_none(num_row_groups);
+                    plan.set(i, access_plan.inner()[i].clone());
+                    current_plan = Some(plan);
+                    current_bytes = rg_bytes;
+                }
+            }
+            // Flush remaining
+            if let Some(plan) = current_plan {
                 let morsel = ParquetMorsel {
                     metadata: Arc::clone(&metadata),
-                    access_plan: morsel_access_plan,
+                    access_plan: plan,
                     is_sub_morsel: false,
                 };
                 let mut f = partitioned_file.clone();
