@@ -448,14 +448,6 @@ pub enum WorkStatus {
     Done,
 }
 
-/// Target number of rows per sub-morsel when splitting.
-///
-/// Controls the granularity of sub-morsel splitting: row groups larger
-/// than this are split into chunks of approximately this size. Row
-/// groups smaller than this are not split at all. This provides
-/// self-regulating behavior — small row groups avoid overhead while
-/// large ones get fine-grained parallelism.
-const TARGET_ROWS_PER_SUB_MORSEL: usize = 100_000;
 
 /// A shared queue of [`PartitionedFile`] morsels for morsel-driven execution.
 ///
@@ -555,7 +547,7 @@ impl WorkQueue {
                     let sub_morsels = opener.split_morsel(
                         morsel,
                         usize::MAX,
-                        TARGET_ROWS_PER_SUB_MORSEL,
+                        0,
                     );
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
