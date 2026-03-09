@@ -595,6 +595,7 @@ impl FileSource for ParquetSource {
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
             has_tightening_filter,
+            max_sub_morsels: base_config.file_groups.len() * 2,
         });
         Ok(opener)
     }
