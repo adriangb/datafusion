@@ -523,7 +523,17 @@ impl WorkQueue {
                     let remaining = morsels.len();
                     let files_remaining = self.files.lock().unwrap().len();
                     let total = remaining + files_remaining;
-                    let split_into = self.num_partitions.saturating_sub(total);
+                    // When queue depth is low, split into num_partitions
+                    // pieces (not just the deficit). This ensures that
+                    // *every* morsel passing through the low-queue state
+                    // gets uniformly split, giving near-perfect photo-
+                    // finish behavior where all workers end at the same
+                    // time.
+                    let split_into = if total < self.num_partitions {
+                        self.num_partitions
+                    } else {
+                        0
+                    };
                     // When we're about to split, increment morselizing_count
                     // to prevent other workers from seeing an empty system
                     // and returning Done while sub-morsels are in flight.
