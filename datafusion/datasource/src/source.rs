@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use datafusion_physical_expr::expressions::{
-    has_tightening_dynamic_filter, DynamicFilterPhysicalExpr,
+    DynamicFilterPhysicalExpr, has_tightening_dynamic_filter,
 };
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{

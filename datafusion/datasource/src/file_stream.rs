@@ -559,10 +559,7 @@ impl WorkQueue {
                     let should_split = self.has_tightening_filter
                         || (total < self.num_partitions
                             && files_remaining == 0
-                            && self
-                                .morselizing_count
-                                .load(Ordering::Relaxed)
-                                == 0);
+                            && self.morselizing_count.load(Ordering::Relaxed) == 0);
                     // When we're about to split, increment morselizing_count
                     // to prevent other workers from seeing an empty system
                     // and returning Done while sub-morsels are in flight.
