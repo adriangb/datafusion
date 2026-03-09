@@ -970,7 +970,8 @@ impl SortExec {
             .map(|sort_expr| Arc::clone(&sort_expr.expr))
             .collect::<Vec<_>>();
         Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
-            DynamicFilterPhysicalExpr::new(children, lit(true)),
+            DynamicFilterPhysicalExpr::new(children, lit(true))
+                .with_tightening(true),
         ))))
     }
 

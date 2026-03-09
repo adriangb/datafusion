@@ -39,6 +39,9 @@ use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
+use datafusion_physical_expr::expressions::{
+    DynamicFilterPhysicalExpr, has_tightening_dynamic_filter,
+};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, conjunction};
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
@@ -542,6 +545,28 @@ impl FileSource for ParquetSource {
             .as_ref()
             .map(|time_unit| parse_coerce_int96_string(time_unit.as_str()).unwrap());
 
+        // Check if any pushed-down predicate is a tightening dynamic
+        // filter (e.g. TopK, aggregation). When present, morsels are
+        // eagerly split so the filter tightens faster.
+        let mut has_tightening_filter = false;
+        let _ = base_config.file_source.apply_expressions(&mut |expr| {
+            if let Some(df) =
+                expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+            {
+                if df.is_tightening() {
+                    has_tightening_filter = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            for child in expr.children() {
+                if has_tightening_dynamic_filter(child) {
+                    has_tightening_filter = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+
         let opener = Arc::new(ParquetOpener {
             partition_index: partition,
             projection: self.projection.clone(),
@@ -569,6 +594,7 @@ impl FileSource for ParquetSource {
             encryption_factory: self.get_encryption_factory_with_config(),
             max_predicate_cache_size: self.max_predicate_cache_size(),
             reverse_row_groups: self.reverse_row_groups,
+            has_tightening_filter,
         });
         Ok(opener)
     }

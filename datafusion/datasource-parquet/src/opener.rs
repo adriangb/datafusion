@@ -68,11 +68,11 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 
-/// Target number of rows per morsel when splitting row groups.
+/// Target number of rows per sub-morsel when splitting.
 ///
 /// Row groups larger than this are split into chunks of approximately
 /// this size. Row groups smaller than this are kept as-is.
-const TARGET_ROWS_PER_MORSEL: usize = 100_000;
+const TARGET_ROWS_PER_SUB_MORSEL: usize = 100_000;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::schema::types::SchemaDescriptor;
 
@@ -130,14 +130,21 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+    /// Whether the query has a tightening dynamic filter (e.g. TopK,
+    /// aggregation). When true, morsels are eagerly split into sub-morsels
+    /// so the filter tightens faster.
+    pub has_tightening_filter: bool,
 }
 
 /// A morsel of work for Parquet execution, containing cached metadata and an access plan.
 pub struct ParquetMorsel {
     /// Cached Parquet metadata
     pub metadata: Arc<ParquetMetaData>,
-    /// Access plan for this morsel (usually selecting a single row group or sub-range)
+    /// Access plan for this morsel (usually selecting a single row group)
     pub access_plan: ParquetAccessPlan,
+    /// Whether this morsel was produced by sub-splitting another morsel.
+    /// Sub-morsels are not split further to avoid cascading splits.
+    pub is_sub_morsel: bool,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -243,6 +250,99 @@ impl FileOpener for ParquetOpener {
             .unwrap_or(false)
     }
 
+    fn split_morsel(
+        &self,
+        file: PartitionedFile,
+        n: usize,
+        min_rows_per_split: usize,
+    ) -> Vec<PartitionedFile> {
+        let Some(morsel) = file
+            .extensions
+            .as_ref()
+            .and_then(|e| e.downcast_ref::<ParquetMorsel>())
+        else {
+            return vec![file];
+        };
+        // Don't re-split sub-morsels to avoid cascading splits.
+        if morsel.is_sub_morsel {
+            return vec![file];
+        }
+        let row_group_indexes: Vec<usize> =
+            morsel.access_plan.row_group_index_iter().collect();
+        let row_group_idx = match row_group_indexes.first() {
+            Some(&idx) => idx,
+            None => return vec![file],
+        };
+        let total_rows = morsel.metadata.row_groups()[row_group_idx].num_rows() as usize;
+        let num_row_groups = morsel.metadata.num_row_groups();
+        let metadata = Arc::clone(&morsel.metadata);
+        let access = morsel.access_plan.inner()[row_group_idx].clone();
+
+        let selected_rows = match &access {
+            RowGroupAccess::Skip => return vec![file],
+            RowGroupAccess::Scan => total_rows,
+            RowGroupAccess::Selection(selection) => selection
+                .iter()
+                .filter(|s| !s.skip)
+                .map(|s| s.row_count)
+                .sum(),
+        };
+
+        // Determine actual split count based on selected row count
+        let n = if min_rows_per_split > 0 {
+            n.min(selected_rows / min_rows_per_split).max(1)
+        } else {
+            n
+        };
+        if n <= 1 {
+            return vec![file];
+        }
+
+        let sub_selections = match &access {
+            RowGroupAccess::Skip => {
+                unreachable!("already checked should_scan")
+            }
+            RowGroupAccess::Scan => {
+                let rows_per_split = total_rows.div_ceil(n);
+                (0..n)
+                    .map(|i| {
+                        let start = i * rows_per_split;
+                        let end = ((i + 1) * rows_per_split).min(total_rows);
+                        let len = end - start;
+                        let mut selectors = Vec::with_capacity(3);
+                        if start > 0 {
+                            selectors.push(RowSelector::skip(start));
+                        }
+                        selectors.push(RowSelector::select(len));
+                        let remaining = total_rows - end;
+                        if remaining > 0 {
+                            selectors.push(RowSelector::skip(remaining));
+                        }
+                        RowSelection::from(selectors)
+                    })
+                    .collect::<Vec<_>>()
+            }
+            RowGroupAccess::Selection(existing) => split_row_selection(existing, n),
+        };
+
+        sub_selections
+            .into_iter()
+            .map(|selection| {
+                let mut sub_plan = ParquetAccessPlan::new_none(num_row_groups);
+                sub_plan.set(row_group_idx, RowGroupAccess::Selection(selection));
+
+                let sub_morsel = ParquetMorsel {
+                    metadata: Arc::clone(&metadata),
+                    access_plan: sub_plan,
+                    is_sub_morsel: true,
+                };
+                let mut f = file.clone();
+                f.extensions = Some(Arc::new(sub_morsel));
+                f
+            })
+            .collect()
+    }
+
     fn morselize(
         &self,
         partitioned_file: PartitionedFile,
@@ -296,6 +396,7 @@ impl FileOpener for ParquetOpener {
         let preserve_order = self.preserve_order;
         let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
         let partition_index = self.partition_index;
+        let has_tightening_filter = self.has_tightening_filter;
 
         Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -475,75 +576,113 @@ impl FileOpener for ParquetOpener {
                 if !access_plan.should_scan(i) {
                     continue;
                 }
-                let access = &access_plan.inner()[i];
-                let total_rows = metadata.row_groups()[i].num_rows() as usize;
-
-                // Determine how many selected rows this row group has
-                let selected_rows = match access {
-                    RowGroupAccess::Skip => continue,
-                    RowGroupAccess::Scan => total_rows,
-                    RowGroupAccess::Selection(sel) => {
-                        sel.iter().filter(|s| !s.skip).map(|s| s.row_count).sum()
-                    }
+                let mut morsel_access_plan = ParquetAccessPlan::new_none(num_row_groups);
+                morsel_access_plan.set(i, access_plan.inner()[i].clone());
+                let morsel = ParquetMorsel {
+                    metadata: Arc::clone(&metadata),
+                    access_plan: morsel_access_plan,
+                    is_sub_morsel: false,
                 };
-
-                let n_splits = (selected_rows / TARGET_ROWS_PER_MORSEL).max(1);
-
-                if n_splits <= 1 {
-                    // Small enough — keep as a single morsel
-                    let mut morsel_access_plan =
-                        ParquetAccessPlan::new_none(num_row_groups);
-                    morsel_access_plan.set(i, access.clone());
-                    let morsel = ParquetMorsel {
-                        metadata: Arc::clone(&metadata),
-                        access_plan: morsel_access_plan,
-                    };
-                    let mut f = partitioned_file.clone();
-                    f.extensions = Some(Arc::new(morsel));
-                    morsels.push(f);
-                } else {
-                    // Split into ~TARGET_ROWS_PER_MORSEL-sized chunks
-                    let sub_selections = match access {
-                        RowGroupAccess::Skip => unreachable!(),
-                        RowGroupAccess::Scan => {
-                            let rows_per_split = total_rows.div_ceil(n_splits);
-                            (0..n_splits)
-                                .map(|j| {
-                                    let start = j * rows_per_split;
-                                    let end = ((j + 1) * rows_per_split).min(total_rows);
-                                    let len = end - start;
-                                    let mut selectors = Vec::with_capacity(3);
-                                    if start > 0 {
-                                        selectors.push(RowSelector::skip(start));
-                                    }
-                                    selectors.push(RowSelector::select(len));
-                                    let remaining = total_rows - end;
-                                    if remaining > 0 {
-                                        selectors.push(RowSelector::skip(remaining));
-                                    }
-                                    RowSelection::from(selectors)
-                                })
-                                .collect::<Vec<_>>()
-                        }
-                        RowGroupAccess::Selection(existing) => {
-                            split_row_selection(existing, n_splits)
-                        }
-                    };
-
-                    for selection in sub_selections {
-                        let mut morsel_access_plan =
-                            ParquetAccessPlan::new_none(num_row_groups);
-                        morsel_access_plan.set(i, RowGroupAccess::Selection(selection));
-                        let morsel = ParquetMorsel {
-                            metadata: Arc::clone(&metadata),
-                            access_plan: morsel_access_plan,
-                        };
-                        let mut f = partitioned_file.clone();
-                        f.extensions = Some(Arc::new(morsel));
-                        morsels.push(f);
-                    }
-                }
+                let mut f = partitioned_file.clone();
+                f.extensions = Some(Arc::new(morsel));
+                morsels.push(f);
             }
+
+            // When a tightening dynamic filter is present (TopK, aggregation),
+            // eagerly split large morsels into sub-morsels so the filter
+            // tightens faster — each completed sub-morsel improves the filter,
+            // allowing subsequent sub-morsels to skip more data.
+            if has_tightening_filter {
+                let mut split_morsels = Vec::with_capacity(morsels.len());
+                for morsel_file in morsels {
+                    let morsel = morsel_file
+                        .extensions
+                        .as_ref()
+                        .and_then(|e| e.downcast_ref::<ParquetMorsel>());
+                    let rg_idx = morsel
+                        .map(|m| m.access_plan.row_group_index_iter().next())
+                        .flatten();
+                    let should_split = rg_idx
+                        .map(|idx| {
+                            let rows = metadata.row_groups()[idx].num_rows() as usize;
+                            rows > TARGET_ROWS_PER_SUB_MORSEL
+                        })
+                        .unwrap_or(false);
+                    if should_split {
+                        let rg_idx = rg_idx.unwrap();
+                        let total_rows =
+                            metadata.row_groups()[rg_idx].num_rows() as usize;
+                        let access = &access_plan.inner()[rg_idx];
+                        let selected_rows = match access {
+                            RowGroupAccess::Skip => 0,
+                            RowGroupAccess::Scan => total_rows,
+                            RowGroupAccess::Selection(sel) => sel
+                                .iter()
+                                .filter(|s| !s.skip)
+                                .map(|s| s.row_count)
+                                .sum(),
+                        };
+                        let n_splits =
+                            (selected_rows / TARGET_ROWS_PER_SUB_MORSEL).max(1);
+                        if n_splits > 1 {
+                            let sub_selections = match access {
+                                RowGroupAccess::Skip => unreachable!(),
+                                RowGroupAccess::Scan => {
+                                    let rows_per_split =
+                                        total_rows.div_ceil(n_splits);
+                                    (0..n_splits)
+                                        .map(|j| {
+                                            let start = j * rows_per_split;
+                                            let end = ((j + 1) * rows_per_split)
+                                                .min(total_rows);
+                                            let len = end - start;
+                                            let mut selectors =
+                                                Vec::with_capacity(3);
+                                            if start > 0 {
+                                                selectors.push(
+                                                    RowSelector::skip(start),
+                                                );
+                                            }
+                                            selectors
+                                                .push(RowSelector::select(len));
+                                            let remaining = total_rows - end;
+                                            if remaining > 0 {
+                                                selectors.push(
+                                                    RowSelector::skip(remaining),
+                                                );
+                                            }
+                                            RowSelection::from(selectors)
+                                        })
+                                        .collect::<Vec<_>>()
+                                }
+                                RowGroupAccess::Selection(existing) => {
+                                    split_row_selection(existing, n_splits)
+                                }
+                            };
+                            for selection in sub_selections {
+                                let mut sub_plan =
+                                    ParquetAccessPlan::new_none(num_row_groups);
+                                sub_plan.set(
+                                    rg_idx,
+                                    RowGroupAccess::Selection(selection),
+                                );
+                                let sub_morsel = ParquetMorsel {
+                                    metadata: Arc::clone(&metadata),
+                                    access_plan: sub_plan,
+                                    is_sub_morsel: true,
+                                };
+                                let mut f = partitioned_file.clone();
+                                f.extensions = Some(Arc::new(sub_morsel));
+                                split_morsels.push(f);
+                            }
+                            continue;
+                        }
+                    }
+                    split_morsels.push(morsel_file);
+                }
+                morsels = split_morsels;
+            }
+
             Ok(morsels)
         })
     }
@@ -1721,6 +1860,7 @@ mod test {
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
                 preserve_order: self.preserve_order,
+                has_tightening_filter: false,
             }
         }
     }
