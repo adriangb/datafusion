@@ -134,6 +134,22 @@ pub(super) struct ParquetOpener {
     pub reverse_row_groups: bool,
 }
 
+/// Per-file context computed once in `morselize()` and reused by `open()` for
+/// every morsel from that file. Avoids redundant schema coercion, predicate
+/// adaptation, and pruning-predicate construction.
+pub struct CachedFileContext {
+    /// Physical file schema after type coercions (int96, utf8view, etc.)
+    pub physical_file_schema: SchemaRef,
+    /// Predicate adapted to the physical file schema (with partition columns replaced)
+    pub adapted_predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Projection adapted to the physical file schema
+    pub adapted_projection: ProjectionExprs,
+    /// Pruning predicate for row group statistics pruning
+    pub pruning_predicate: Option<Arc<PruningPredicate>>,
+    /// ArrowReaderOptions with the correct schema set
+    pub reader_options: ArrowReaderOptions,
+}
+
 /// A morsel of work for Parquet execution, containing cached metadata and an access plan.
 pub struct ParquetMorsel {
     /// Cached Parquet metadata
@@ -143,6 +159,8 @@ pub struct ParquetMorsel {
     /// Whether this morsel was produced by sub-splitting another morsel.
     /// Sub-morsels are not split further to avoid cascading splits.
     pub is_sub_morsel: bool,
+    /// Per-file context cached from morselize() to avoid redundant work in open()
+    pub file_context: Option<Arc<CachedFileContext>>,
 }
 
 /// Represents a prepared access plan with optional row selection
@@ -272,6 +290,7 @@ impl FileOpener for ParquetOpener {
 
         // Multi-row-group morsel: split into individual row group morsels
         if row_group_indexes.len() > 1 {
+            let file_context = morsel.file_context.clone();
             return row_group_indexes
                 .iter()
                 .map(|&idx| {
@@ -282,6 +301,7 @@ impl FileOpener for ParquetOpener {
                         metadata: Arc::clone(&metadata),
                         access_plan: plan,
                         is_sub_morsel: false,
+                        file_context: file_context.clone(),
                     }));
                     f
                 })
@@ -388,7 +408,9 @@ impl FileOpener for ParquetOpener {
         let preserve_order = self.preserve_order;
         let parquet_file_reader_factory = Arc::clone(&self.parquet_file_reader_factory);
         let partition_index = self.partition_index;
-        let projection_column_indices = self.projection.column_indices();
+        let projection = self.projection.clone();
+        let projection_column_indices = projection.column_indices();
+        let coerce_int96 = self.coerce_int96;
 
         Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -427,9 +449,41 @@ impl FileOpener for ParquetOpener {
                     .await?;
             let num_row_groups = reader_metadata.metadata().num_row_groups();
 
-            // Adapt the physical schema to the file schema for pruning
-            let physical_file_schema = Arc::clone(reader_metadata.schema());
+            // Apply schema coercions (int96, utf8view, etc.) — matches open()
             let logical_file_schema = table_schema.file_schema();
+            let mut physical_file_schema = Arc::clone(reader_metadata.schema());
+            let mut reader_options = options.clone();
+
+            if let Some(merged) = apply_file_schema_type_coercions(
+                logical_file_schema,
+                &physical_file_schema,
+            ) {
+                physical_file_schema = Arc::new(merged);
+                reader_options =
+                    reader_options.with_schema(Arc::clone(&physical_file_schema));
+                reader_metadata = ArrowReaderMetadata::try_new(
+                    Arc::clone(reader_metadata.metadata()),
+                    reader_options.clone(),
+                )?;
+            }
+
+            if let Some(ref coerce) = coerce_int96
+                && let Some(merged) = coerce_int96_to_resolution(
+                    reader_metadata.parquet_schema(),
+                    &physical_file_schema,
+                    coerce,
+                )
+            {
+                physical_file_schema = Arc::new(merged);
+                reader_options =
+                    reader_options.with_schema(Arc::clone(&physical_file_schema));
+                reader_metadata = ArrowReaderMetadata::try_new(
+                    Arc::clone(reader_metadata.metadata()),
+                    reader_options.clone(),
+                )?;
+            }
+
+            // Adapt predicate and projection to the physical file schema
             let rewriter = expr_adapter_factory.create(
                 Arc::clone(logical_file_schema),
                 Arc::clone(&physical_file_schema),
@@ -437,9 +491,6 @@ impl FileOpener for ParquetOpener {
             let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
 
             // Replace partition column references with their literal values before rewriting.
-            // This mirrors what `open()` does. Without this, expressions like `val != part`
-            // (where `part` is a partition column) would cause `rewriter.rewrite` to fail
-            // since the partition column is not in the logical file schema.
             let literal_columns: HashMap<String, ScalarValue> = table_schema
                 .table_partition_cols()
                 .iter()
@@ -447,17 +498,25 @@ impl FileOpener for ParquetOpener {
                 .map(|(field, value)| (field.name().clone(), value.clone()))
                 .collect();
 
-            let adapted_predicate = predicate
-                .as_ref()
-                .map(|p| {
-                    let p = if !literal_columns.is_empty() {
-                        replace_columns_with_literals(Arc::clone(p), &literal_columns)?
-                    } else {
-                        Arc::clone(p)
-                    };
-                    simplifier.simplify(rewriter.rewrite(p)?)
-                })
+            let mut adapted_projection = projection.clone();
+            let mut adapted_predicate = predicate.clone();
+            if !literal_columns.is_empty() {
+                adapted_projection =
+                    adapted_projection.try_map_exprs(|expr| {
+                        replace_columns_with_literals(
+                            Arc::clone(&expr),
+                            &literal_columns,
+                        )
+                    })?;
+                adapted_predicate = adapted_predicate
+                    .map(|p| replace_columns_with_literals(p, &literal_columns))
+                    .transpose()?;
+            }
+            adapted_predicate = adapted_predicate
+                .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
                 .transpose()?;
+            adapted_projection = adapted_projection
+                .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
 
             let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
                 adapted_predicate.as_ref(),
@@ -563,6 +622,16 @@ impl FileOpener for ParquetOpener {
                 );
             }
 
+            // Build cached file context so open() can skip redundant work
+            // (schema coercion, predicate adaptation, pruning predicate construction).
+            let file_context = Arc::new(CachedFileContext {
+                physical_file_schema: Arc::clone(&physical_file_schema),
+                adapted_predicate: adapted_predicate.clone(),
+                adapted_projection: adapted_projection,
+                pruning_predicate,
+                reader_options,
+            });
+
             // Group adjacent scannable row groups into morsels based on
             // projected compressed bytes. Small row groups are combined into
             // a single morsel to reduce per-morsel overhead (reader creation,
@@ -592,6 +661,7 @@ impl FileOpener for ParquetOpener {
                             metadata: Arc::clone(&metadata),
                             access_plan: plan.clone(),
                             is_sub_morsel: false,
+                            file_context: Some(Arc::clone(&file_context)),
                         };
                         let mut f = partitioned_file.clone();
                         f.extensions = Some(Arc::new(morsel));
@@ -617,6 +687,7 @@ impl FileOpener for ParquetOpener {
                     metadata: Arc::clone(&metadata),
                     access_plan: plan,
                     is_sub_morsel: false,
+                    file_context: Some(Arc::clone(&file_context)),
                 };
                 let mut f = partitioned_file.clone();
                 f.extensions = Some(Arc::new(morsel));
@@ -731,6 +802,11 @@ impl FileOpener for ParquetOpener {
             .as_ref()
             .map(|e| e.is::<ParquetMorsel>())
             .unwrap_or(false);
+        let cached_file_context = partitioned_file
+            .extensions
+            .as_ref()
+            .and_then(|e| e.downcast_ref::<ParquetMorsel>())
+            .and_then(|m| m.file_context.clone());
 
         Ok(Box::pin(async move {
             #[cfg(feature = "parquet_encryption")]
@@ -807,115 +883,94 @@ impl FileOpener for ParquetOpener {
             }
             let mut metadata_timer = file_metrics.metadata_load_time.timer();
 
-            // Begin by loading the metadata from the underlying reader (note
-            // the returned metadata may actually include page indexes as some
-            // readers may return page indexes even when not requested -- for
-            // example when they are cached).
-            // If this is a morsel, we might already have the metadata cached.
-            let mut reader_metadata = if let Some(morsel) = partitioned_file
-                .extensions
-                .as_ref()
-                .and_then(|e| e.downcast_ref::<ParquetMorsel>())
-            {
-                ArrowReaderMetadata::try_new(
-                    Arc::clone(&morsel.metadata),
-                    options.clone(),
-                )?
-            } else {
-                ArrowReaderMetadata::load_async(&mut async_file_reader, options.clone())
-                    .await?
-            };
+            // When a cached file context is available (morsel path), reuse
+            // the schema, adapted predicate/projection, and pruning predicates
+            // that were computed once per file in morselize(). This avoids
+            // redundant schema coercion, expression rewriting, and pruning
+            // predicate construction for every morsel from the same file.
+            let (reader_metadata, physical_file_schema, pruning_predicate, page_pruning_predicate, has_dynamic_predicate) =
+                if let Some(ctx) = cached_file_context {
+                    let morsel_metadata = partitioned_file
+                        .extensions
+                        .as_ref()
+                        .and_then(|e| e.downcast_ref::<ParquetMorsel>())
+                        .expect("cached_file_context implies morsel");
+                    let reader_metadata = ArrowReaderMetadata::try_new(
+                        Arc::clone(&morsel_metadata.metadata),
+                        ctx.reader_options.clone(),
+                    )?;
+                    predicate = ctx.adapted_predicate.clone();
+                    projection = ctx.adapted_projection.clone();
+                    let has_dynamic = predicate.as_ref().is_some_and(is_dynamic_physical_expr);
+                    metadata_timer.stop();
+                    (reader_metadata, ctx.physical_file_schema.clone(), ctx.pruning_predicate.clone(), None, has_dynamic)
+                } else {
+                    // Non-morsel path: compute everything from scratch
+                    let mut reader_metadata =
+                        ArrowReaderMetadata::load_async(&mut async_file_reader, options.clone())
+                            .await?;
+                    let mut physical_file_schema = Arc::clone(reader_metadata.schema());
 
-            // Note about schemas: we are actually dealing with **3 different schemas** here:
-            // - The table schema as defined by the TableProvider.
-            //   This is what the user sees, what they get when they `SELECT * FROM table`, etc.
-            // - The logical file schema: this is the table schema minus any hive partition columns and projections.
-            //   This is what the physical file schema is coerced to.
-            // - The physical file schema: this is the schema that the arrow-rs
-            //   parquet reader will actually produce.
-            let mut physical_file_schema = Arc::clone(reader_metadata.schema());
+                    if let Some(merged) = apply_file_schema_type_coercions(
+                        &logical_file_schema,
+                        &physical_file_schema,
+                    ) {
+                        physical_file_schema = Arc::new(merged);
+                        options = options.with_schema(Arc::clone(&physical_file_schema));
+                        reader_metadata = ArrowReaderMetadata::try_new(
+                            Arc::clone(reader_metadata.metadata()),
+                            options.clone(),
+                        )?;
+                    }
 
-            // The schema loaded from the file may not be the same as the
-            // desired schema (for example if we want to instruct the parquet
-            // reader to read strings using Utf8View instead). Update if necessary
-            if let Some(merged) = apply_file_schema_type_coercions(
-                &logical_file_schema,
-                &physical_file_schema,
-            ) {
-                physical_file_schema = Arc::new(merged);
-                options = options.with_schema(Arc::clone(&physical_file_schema));
-                reader_metadata = ArrowReaderMetadata::try_new(
-                    Arc::clone(reader_metadata.metadata()),
-                    options.clone(),
-                )?;
-            }
+                    if let Some(ref coerce) = coerce_int96
+                        && let Some(merged) = coerce_int96_to_resolution(
+                            reader_metadata.parquet_schema(),
+                            &physical_file_schema,
+                            coerce,
+                        )
+                    {
+                        physical_file_schema = Arc::new(merged);
+                        options = options.with_schema(Arc::clone(&physical_file_schema));
+                        reader_metadata = ArrowReaderMetadata::try_new(
+                            Arc::clone(reader_metadata.metadata()),
+                            options.clone(),
+                        )?;
+                    }
 
-            if let Some(ref coerce) = coerce_int96
-                && let Some(merged) = coerce_int96_to_resolution(
-                    reader_metadata.parquet_schema(),
-                    &physical_file_schema,
-                    coerce,
-                )
-            {
-                physical_file_schema = Arc::new(merged);
-                options = options.with_schema(Arc::clone(&physical_file_schema));
-                reader_metadata = ArrowReaderMetadata::try_new(
-                    Arc::clone(reader_metadata.metadata()),
-                    options.clone(),
-                )?;
-            }
+                    let rewriter = expr_adapter_factory.create(
+                        Arc::clone(&logical_file_schema),
+                        Arc::clone(&physical_file_schema),
+                    )?;
+                    let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
+                    predicate = predicate
+                        .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
+                        .transpose()?;
+                    projection = projection
+                        .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
 
-            // Adapt the projection & filter predicate to the physical file schema.
-            // This evaluates missing columns and inserts any necessary casts.
-            // After rewriting to the file schema, further simplifications may be possible.
-            // For example, if `'a' = col_that_is_missing` becomes `'a' = NULL` that can then be simplified to `FALSE`
-            // and we can avoid doing any more work on the file (bloom filters, loading the page index, etc.).
-            // Additionally, if any casts were inserted we can move casts from the column to the literal side:
-            // `CAST(col AS INT) = 5` can become `col = CAST(5 AS <col type>)`, which can be evaluated statically.
-            let rewriter = expr_adapter_factory.create(
-                Arc::clone(&logical_file_schema),
-                Arc::clone(&physical_file_schema),
-            )?;
-            let simplifier = PhysicalExprSimplifier::new(&physical_file_schema);
-            predicate = predicate
-                .map(|p| simplifier.simplify(rewriter.rewrite(p)?))
-                .transpose()?;
-            // Adapt projections to the physical file schema as well
-            projection = projection
-                .try_map_exprs(|p| simplifier.simplify(rewriter.rewrite(p)?))?;
+                    let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
+                        predicate.as_ref(),
+                        &physical_file_schema,
+                        &predicate_creation_errors,
+                    );
 
-            // Build predicates for this specific file
-            let (pruning_predicate, page_pruning_predicate) = build_pruning_predicates(
-                predicate.as_ref(),
-                &physical_file_schema,
-                &predicate_creation_errors,
-            );
+                    let has_dynamic =
+                        predicate.as_ref().is_some_and(is_dynamic_physical_expr);
 
-            // Track whether the predicate contains dynamic filters. Dynamic
-            // filters (e.g. from hash joins or TopK) can tighten during
-            // execution, so morsels that passed row-group pruning during
-            // morselize() may now be prunable with the updated filter values.
-            let has_dynamic_predicate =
-                predicate.as_ref().is_some_and(is_dynamic_physical_expr);
+                    if should_enable_page_index(enable_page_index, &page_pruning_predicate)
+                    {
+                        reader_metadata = load_page_index(
+                            reader_metadata,
+                            &mut async_file_reader,
+                            options.with_page_index_policy(PageIndexPolicy::Optional),
+                        )
+                        .await?;
+                    }
 
-            // The page index is not stored inline in the parquet footer so the
-            // code above may not have read the page index structures yet. If we
-            // need them for reading and they aren't yet loaded, we need to load them now.
-            // For morsels, the page index was already loaded (if needed) in morselize().
-            // Skip it here to avoid redundant I/O.
-            if should_enable_page_index(enable_page_index, &page_pruning_predicate)
-                && !is_morsel
-            {
-                reader_metadata = load_page_index(
-                    reader_metadata,
-                    &mut async_file_reader,
-                    // Since we're manually loading the page index the option here should not matter but we pass it in for consistency
-                    options.with_page_index_policy(PageIndexPolicy::Optional),
-                )
-                .await?;
-            }
-
-            metadata_timer.stop();
+                    metadata_timer.stop();
+                    (reader_metadata, physical_file_schema, pruning_predicate, page_pruning_predicate, has_dynamic)
+                };
 
             // ---------------------------------------------------------
             // Step: construct builder for the final RecordBatch stream
@@ -1571,10 +1626,17 @@ fn split_into_sub_morsels(
             let mut sub_plan = ParquetAccessPlan::new_none(num_row_groups);
             sub_plan.set(row_group_idx, RowGroupAccess::Selection(selection));
 
+            // Propagate file_context from the parent morsel
+            let file_context = file
+                .extensions
+                .as_ref()
+                .and_then(|e| e.downcast_ref::<ParquetMorsel>())
+                .and_then(|m| m.file_context.clone());
             let sub_morsel = ParquetMorsel {
                 metadata: Arc::clone(metadata),
                 access_plan: sub_plan,
                 is_sub_morsel: true,
+                file_context,
             };
             let mut f = file.clone();
             f.extensions = Some(Arc::new(sub_morsel));
