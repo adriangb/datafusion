@@ -539,8 +539,8 @@ impl WorkQueue {
         if let Some(morsel) = morsel {
             if split_into > 1 {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels = opener
-                        .split_morsel(morsel, split_into, MIN_ROWS_PER_SUB_MORSEL);
+                    let sub_morsels =
+                        opener.split_morsel(morsel, split_into, MIN_ROWS_PER_SUB_MORSEL);
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
                         let first = iter.next().unwrap();
