@@ -74,7 +74,7 @@ use parquet::file::metadata::ParquetMetaData;
 /// scans (e.g. `SELECT MIN(col)`) naturally avoid splitting while wide
 /// scans get fine-grained parallelism. Row groups whose projected data
 /// is smaller than this threshold are never split.
-const TARGET_BYTES_PER_SUB_MORSEL: usize = 8 * 1024 * 1024; // 8 MB
+const TARGET_BYTES_PER_SUB_MORSEL: usize = 1024 * 1024; // 1 MB
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
 use parquet::schema::types::SchemaDescriptor;
 
