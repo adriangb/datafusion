@@ -57,6 +57,12 @@ impl FilterState {
 /// [Dynamic Filters: Passing Information Between Operators During Execution for 25x Faster Queries blog]: https://datafusion.apache.org/blog/2025/09/10/dynamic-filters
 #[derive(Debug)]
 pub struct DynamicFilterPhysicalExpr {
+    /// Whether this filter progressively tightens during execution (e.g.
+    /// TopK, aggregation). Tightening filters benefit from finer-grained
+    /// morsels because each completed morsel can improve the filter,
+    /// allowing subsequent morsels to skip more data. One-shot filters
+    /// (e.g. hash join build side) are set once and do not tighten.
+    tightening: bool,
     /// The original children of this PhysicalExpr, if any.
     /// This is necessary because the dynamic filter may be initialized with a placeholder (e.g. `lit(true)`)
     /// and later remapped to the actual expressions that are being filtered.
@@ -171,6 +177,7 @@ impl DynamicFilterPhysicalExpr {
     ) -> Self {
         let (state_watch, _) = watch::channel(FilterState::InProgress { generation: 1 });
         Self {
+            tightening: false,
             children,
             remapped_children: None, // Initially no remapped children
             inner: Arc::new(RwLock::new(Inner::new(inner))),
@@ -178,6 +185,18 @@ impl DynamicFilterPhysicalExpr {
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Mark this filter as a tightening filter that progressively
+    /// improves during execution (e.g. TopK, aggregation filters).
+    pub fn with_tightening(mut self, tightening: bool) -> Self {
+        self.tightening = tightening;
+        self
+    }
+
+    /// Returns true if this filter progressively tightens during execution.
+    pub fn is_tightening(&self) -> bool {
+        self.tightening
     }
 
     fn remap_children(
@@ -372,6 +391,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
             state_watch: self.state_watch.clone(),
             data_type: Arc::clone(&self.data_type),
             nullable: Arc::clone(&self.nullable),
+            tightening: self.tightening,
         }))
     }
 
@@ -448,6 +468,25 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         // Return the current generation of the expression.
         self.inner.read().generation
     }
+}
+
+/// Returns true if the expression tree contains a tightening dynamic
+/// filter — one that progressively improves during execution (e.g.
+/// TopK, aggregation). This is used to decide whether finer-grained
+/// morsel splitting is worthwhile.
+pub fn has_tightening_dynamic_filter(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let mut found = false;
+    expr.apply(|e| {
+        if let Some(dyn_filter) = e.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
+            && dyn_filter.is_tightening()
+        {
+            found = true;
+            return Ok(datafusion_common::tree_node::TreeNodeRecursion::Stop);
+        }
+        Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+    })
+    .expect("this traversal is infallible");
+    found
 }
 
 #[cfg(test)]
