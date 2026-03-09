@@ -24,9 +24,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use datafusion_physical_expr::expressions::{
-    DynamicFilterPhysicalExpr, has_tightening_dynamic_filter,
-};
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_plan::execution_plan::{
     Boundedness, EmissionType, SchedulingType,
@@ -369,28 +366,6 @@ impl ExecutionPlan for DataSourceExec {
             let opener_for_queue =
                 source.create_file_opener(object_store, config, partition)?;
             let num_partitions = config.file_groups.len();
-            // Check if any pushed-down predicate is a tightening dynamic
-            // filter (e.g. TopK, aggregation).  When present, the WorkQueue
-            // will split morsels more aggressively so the filter tightens
-            // faster.
-            let mut has_tightening = false;
-            let _ = config.apply_expressions(&mut |expr| {
-                if let Some(df) =
-                    expr.as_any().downcast_ref::<DynamicFilterPhysicalExpr>()
-                {
-                    if df.is_tightening() {
-                        has_tightening = true;
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                }
-                for child in expr.children() {
-                    if has_tightening_dynamic_filter(child) {
-                        has_tightening = true;
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
-                }
-                Ok(TreeNodeRecursion::Continue)
-            });
             let queue = context.get_or_insert_shared_state(key, || {
                 let all_files = config
                     .file_groups
@@ -398,7 +373,6 @@ impl ExecutionPlan for DataSourceExec {
                     .flat_map(|g| g.files().iter().cloned())
                     .collect();
                 WorkQueue::new(all_files, num_partitions, Some(opener_for_queue))
-                    .with_tightening_filter(has_tightening)
             });
             let stream =
                 config.open_with_queue(partition, &context, Some(Arc::clone(&queue)))?;

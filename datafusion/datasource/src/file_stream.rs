@@ -481,11 +481,6 @@ pub struct WorkQueue {
     num_partitions: usize,
     /// File opener used to split morsels into sub-morsels.
     file_opener: Option<Arc<dyn FileOpener>>,
-    /// Whether the query has a tightening dynamic filter (e.g. TopK,
-    /// aggregation). When true, morsels are always split into sub-morsels
-    /// so the filter tightens faster — each completed sub-morsel improves
-    /// the filter, allowing subsequent sub-morsels to skip more data.
-    has_tightening_filter: bool,
 }
 
 impl std::fmt::Debug for WorkQueue {
@@ -495,7 +490,6 @@ impl std::fmt::Debug for WorkQueue {
             .field("morsels", &self.morsels)
             .field("morselizing_count", &self.morselizing_count)
             .field("num_partitions", &self.num_partitions)
-            .field("has_tightening_filter", &self.has_tightening_filter)
             .finish()
     }
 }
@@ -514,14 +508,7 @@ impl WorkQueue {
             notify: Notify::new(),
             num_partitions,
             file_opener,
-            has_tightening_filter: false,
         }
-    }
-
-    /// Set whether the query has a tightening dynamic filter.
-    pub fn with_tightening_filter(mut self, has_tightening_filter: bool) -> Self {
-        self.has_tightening_filter = has_tightening_filter;
-        self
     }
 
     /// Pull a work item from the queue.
@@ -529,8 +516,8 @@ impl WorkQueue {
     /// Prefers already-morselized morsels (for I/O locality) over whole
     /// files that still need morselizing.
     ///
-    /// When the morsel queue depth is low (<= `num_partitions`), attempts
-    /// to split the pulled morsel into sub-morsels to keep more workers busy.
+    /// When there are fewer morsels than workers, splits the pulled morsel
+    /// into sub-morsels to keep all workers busy.
     pub fn pull(&self) -> WorkStatus {
         // First try the morsel queue — these are ready to open immediately
         // and preserve locality with the file that was just morselized.
@@ -541,25 +528,15 @@ impl WorkQueue {
                     let remaining = morsels.len();
                     let files_remaining = self.files.lock().unwrap().len();
                     let total = remaining + files_remaining;
-                    // Two modes of splitting:
-                    //
-                    // 1. Tightening filter (TopK, aggregation): always
-                    //    split so the filter improves faster — each
-                    //    completed sub-morsel tightens the filter,
-                    //    allowing subsequent sub-morsels to skip data.
-                    //
-                    // 2. Normal: only split at the true tail of
-                    //    execution when all files have been morselized
-                    //    and no more morsels are coming. This avoids
-                    //    overhead during steady-state draining.
-                    //
-                    // In both cases, the actual split granularity is
-                    // controlled by TARGET_ROWS_PER_SUB_MORSEL, so
-                    // small row groups are never split.
-                    let should_split = self.has_tightening_filter
-                        || (total < self.num_partitions
-                            && files_remaining == 0
-                            && self.morselizing_count.load(Ordering::Relaxed) == 0);
+                    // Split when there aren't enough morsels for all
+                    // workers and no more are coming. Each morsel is
+                    // split into ~TARGET_ROWS_PER_SUB_MORSEL-row pieces,
+                    // which keeps all workers busy while remaining large
+                    // enough to amortise per-morsel overhead. Small row
+                    // groups (< TARGET_ROWS_PER_SUB_MORSEL) are never split.
+                    let should_split = total < self.num_partitions
+                        && files_remaining == 0
+                        && self.morselizing_count.load(Ordering::Relaxed) == 0;
                     // When we're about to split, increment morselizing_count
                     // to prevent other workers from seeing an empty system
                     // and returning Done while sub-morsels are in flight.
@@ -575,9 +552,6 @@ impl WorkQueue {
         if let Some(morsel) = morsel {
             if should_split {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
-                    // Pass usize::MAX as the split count — the actual
-                    // number of sub-morsels is controlled entirely by
-                    // TARGET_ROWS_PER_SUB_MORSEL inside split_morsel.
                     let sub_morsels = opener.split_morsel(
                         morsel,
                         usize::MAX,
