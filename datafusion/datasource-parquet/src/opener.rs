@@ -1211,9 +1211,6 @@ impl FileOpener for ParquetOpener {
                     arrow_reader_metrics,
                     predicate_cache_inner_records,
                     predicate_cache_records,
-                    current_reader: None,
-                    prefetched_reader: None,
-                    finished: false,
                 },
                 |mut state| async move {
                     let result = state.transition().await;
@@ -1240,16 +1237,12 @@ impl FileOpener for ParquetOpener {
     }
 }
 
-/// State for a stream that decodes a single Parquet file using a push-based decoder
-/// with IO prefetching.
+/// State for a stream that decodes a single Parquet file using a push-based decoder.
 ///
-/// Uses [`ParquetPushDecoder::try_next_reader`] to separate IO from decoding.
-/// All IO for a row group is completed upfront (via [`feed_until_reader`]),
-/// producing a synchronous [`ParquetRecordBatchReader`]. Before iterating
-/// that reader, IO for the *next* row group is eagerly prefetched so the data
-/// is already buffered by the time the current reader is exhausted.
-///
-/// [`feed_until_reader`]: Self::feed_until_reader
+/// The [`transition`](Self::transition) method drives the decoder in a loop: it requests
+/// byte ranges from the [`AsyncFileReader`], pushes the fetched data into the
+/// [`ParquetPushDecoder`], and yields projected [`RecordBatch`]es until the file is
+/// fully consumed.
 struct PushDecoderStreamState {
     decoder: ParquetPushDecoder,
     reader: Box<dyn AsyncFileReader>,
@@ -1259,138 +1252,41 @@ struct PushDecoderStreamState {
     arrow_reader_metrics: ArrowReaderMetrics,
     predicate_cache_inner_records: Gauge,
     predicate_cache_records: Gauge,
-    /// The current synchronous batch reader for the active row group.
-    current_reader:
-        Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-    /// A reader obtained during IO prefetch, ready for the next row group.
-    prefetched_reader:
-        Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>,
-    /// Whether the decoder has signalled [`DecodeResult::Finished`].
-    finished: bool,
 }
 
 impl PushDecoderStreamState {
-    /// Feed IO to the decoder until it either produces a
-    /// [`ParquetRecordBatchReader`] or signals that all data has been consumed.
+    /// Advances the decoder state machine until the next [`RecordBatch`] is
+    /// produced, the file is fully consumed, or an error occurs.
     ///
-    /// If a reader was already obtained during prefetch, returns it immediately.
-    async fn feed_until_reader(
-        &mut self,
-    ) -> Result<Option<parquet::arrow::arrow_reader::ParquetRecordBatchReader>> {
-        if let Some(r) = self.prefetched_reader.take() {
-            return Ok(Some(r));
-        }
-        loop {
-            match self.decoder.try_next_reader() {
-                Ok(DecodeResult::NeedsData(ranges)) => {
-                    let data = self
-                        .reader
-                        .get_byte_ranges(ranges.clone())
-                        .await
-                        .map_err(|e| DataFusionError::from(ParquetError::from(e)))?;
-                    self.decoder
-                        .push_ranges(ranges, data)
-                        .map_err(DataFusionError::from)?;
-                }
-                Ok(DecodeResult::Data(batch_reader)) => {
-                    return Ok(Some(batch_reader));
-                }
-                Ok(DecodeResult::Finished) => {
-                    self.finished = true;
-                    return Ok(None);
-                }
-                Err(e) => {
-                    return Err(DataFusionError::from(e));
-                }
-            }
-        }
-    }
-
-    /// Eagerly prefetch IO for the next row group and stash the resulting
-    /// reader so [`feed_until_reader`](Self::feed_until_reader) can return it
-    /// without any further IO.
-    async fn prefetch_next_io(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        loop {
-            match self.decoder.try_next_reader() {
-                Ok(DecodeResult::NeedsData(ranges)) => {
-                    let data = self
-                        .reader
-                        .get_byte_ranges(ranges.clone())
-                        .await
-                        .map_err(|e| DataFusionError::from(ParquetError::from(e)))?;
-                    self.decoder
-                        .push_ranges(ranges, data)
-                        .map_err(DataFusionError::from)?;
-                }
-                Ok(DecodeResult::Data(next_reader)) => {
-                    self.prefetched_reader = Some(next_reader);
-                    return Ok(());
-                }
-                Ok(DecodeResult::Finished) => {
-                    self.finished = true;
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(DataFusionError::from(e));
-                }
-            }
-        }
-    }
-
-    /// Advances the state machine until the next [`RecordBatch`] is produced,
-    /// the file is fully consumed, or an error occurs.
-    ///
-    /// The lifecycle per row group is:
-    /// 1. Complete all IO for the row group → obtain a [`ParquetRecordBatchReader`].
-    /// 2. Eagerly prefetch IO for the *next* row group (stashed in
-    ///    [`prefetched_reader`](Self::prefetched_reader)).
-    /// 3. Iterate the current reader, yielding one batch per call.
-    /// 4. When the reader is exhausted, the prefetched reader (if any) becomes
-    ///    the current reader and the cycle repeats.
+    /// On each iteration the decoder is polled via [`ParquetPushDecoder::try_decode`]:
+    /// - [`NeedsData`](DecodeResult::NeedsData) – the requested byte ranges are
+    ///   fetched from the [`AsyncFileReader`] and fed back into the decoder.
+    /// - [`Data`](DecodeResult::Data) – a decoded batch is projected and returned.
+    /// - [`Finished`](DecodeResult::Finished) – signals end-of-stream (`None`).
     async fn transition(&mut self) -> Option<Result<RecordBatch>> {
         loop {
-            // Drain the current reader first.
-            if let Some(ref mut batch_reader) = self.current_reader {
-                match batch_reader.next() {
-                    Some(Ok(batch)) => {
-                        self.copy_arrow_reader_metrics();
-                        return Some(self.project_batch(&batch));
-                    }
-                    Some(Err(e)) => {
-                        self.current_reader = None;
-                        return Some(Err(DataFusionError::from(ParquetError::from(
-                            e,
-                        ))));
-                    }
-                    None => {
-                        // Current reader exhausted; drop it and get the next.
-                        self.current_reader = None;
+            match self.decoder.try_decode() {
+                Ok(DecodeResult::NeedsData(ranges)) => {
+                    let fetch = async {
+                        let data = self.reader.get_byte_ranges(ranges.clone()).await?;
+                        self.decoder.push_ranges(ranges, data)?;
+                        Ok::<_, ParquetError>(())
+                    };
+                    if let Err(e) = fetch.await {
+                        return Some(Err(DataFusionError::from(e)));
                     }
                 }
+                Ok(DecodeResult::Data(batch)) => {
+                    self.copy_arrow_reader_metrics();
+                    return Some(self.project_batch(&batch));
+                }
+                Ok(DecodeResult::Finished) => {
+                    return None;
+                }
+                Err(e) => {
+                    return Some(Err(DataFusionError::from(e)));
+                }
             }
-
-            if self.finished {
-                return None;
-            }
-
-            // Get the next reader (from prefetch or fresh IO).
-            let batch_reader = match self.feed_until_reader().await {
-                Ok(Some(r)) => r,
-                Ok(None) => return None,
-                Err(e) => return Some(Err(e)),
-            };
-            self.current_reader = Some(batch_reader);
-
-            // Eagerly prefetch IO for the row group after this one so the
-            // data is already buffered by the time we exhaust current_reader.
-            if let Err(e) = self.prefetch_next_io().await {
-                return Some(Err(e));
-            }
-
-            // Loop back to drain current_reader.
         }
     }
 
