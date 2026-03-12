@@ -261,7 +261,15 @@ impl FileStream {
                         self.file_stream_metrics.files_opened.add(1);
                         // include time needed to start opening in `start_next_file`
                         self.file_stream_metrics.time_opening.stop();
-                        let next = self.start_next_file().transpose();
+                        let next = {
+                            let scanning_total_metric = self
+                                .file_stream_metrics
+                                .time_scanning_total
+                                .metrics
+                                .clone();
+                            let _timer = scanning_total_metric.timer();
+                            self.start_next_file().transpose()
+                        };
                         self.file_stream_metrics.time_scanning_until_data.start();
                         self.file_stream_metrics.time_scanning_total.start();
 
@@ -448,7 +456,6 @@ pub enum WorkStatus {
     Done,
 }
 
-
 /// A shared queue of [`PartitionedFile`] morsels for morsel-driven execution.
 ///
 /// Internally keeps two queues: one for whole files that still need
@@ -544,11 +551,8 @@ impl WorkQueue {
         if let Some(morsel) = morsel {
             if should_split {
                 let result = if let Some(opener) = self.file_opener.as_ref() {
-                    let sub_morsels = opener.split_morsel(
-                        morsel,
-                        self.num_partitions * 2,
-                        0,
-                    );
+                    let sub_morsels =
+                        opener.split_morsel(morsel, self.num_partitions * 2, 0);
                     if sub_morsels.len() > 1 {
                         let mut iter = sub_morsels.into_iter();
                         let first = iter.next().unwrap();
