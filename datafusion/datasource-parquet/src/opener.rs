@@ -19,6 +19,7 @@
 
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_group_filter::RowGroupAccessPlanFilter;
+use crate::sort::reverse_row_selection;
 use crate::{
     ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory, RowGroupAccess,
     apply_file_schema_type_coercions, coerce_int96_to_resolution, row_filter,
