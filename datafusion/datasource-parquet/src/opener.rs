@@ -52,7 +52,6 @@ use datafusion_physical_plan::metrics::{
 };
 use datafusion_pruning::{FilePruner, PruningPredicate, build_pruning_predicate};
 
-use crate::sort::reverse_row_selection;
 #[cfg(feature = "parquet_encryption")]
 use datafusion_common::config::EncryptionFactoryOptions;
 #[cfg(feature = "parquet_encryption")]
@@ -249,6 +248,7 @@ impl ParquetOpener {
         Ok(row_groups)
     }
 }
+
 
 impl FileOpener for ParquetOpener {
     fn is_leaf_morsel(&self, file: &PartitionedFile) -> bool {
@@ -1102,8 +1102,7 @@ impl FileOpener for ParquetOpener {
             }
 
             // Prepare the access plan (extract row groups and row selection)
-            let mut prepared_plan =
-                PreparedAccessPlan::from_access_plan(access_plan, rg_metadata)?;
+            let mut prepared_plan = access_plan.prepare(rg_metadata)?;
 
             // ----------------------------------------------------------
             // Step: potentially reverse the access plan for performance.
