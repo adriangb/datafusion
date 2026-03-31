@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`ParquetOpener`] state machine for opening Parquet files
+//! [`ParquetOpener`] and [`ParquetMorselizer`] state machines for opening Parquet files
 
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::row_filter::build_projection_read_plan;
@@ -26,15 +26,21 @@ use crate::{
 };
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::datatypes::DataType;
+use datafusion_common::internal_datafusion_err;
+use datafusion_common::internal_err;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
+use datafusion_datasource::morsel::{Morsel, MorselPlan, MorselPlanner, Morselizer};
 use datafusion_physical_expr::projection::{ProjectionExprs, Projector};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
 use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::task::{Context, Poll};
 
 use arrow::datatypes::{Schema, SchemaRef, TimeUnit};
@@ -77,12 +83,26 @@ use parquet::bloom_filter::Sbbf;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
-/// Entry point for opening a Parquet file
+/// Implements [`FileOpener`] for Parquet
+#[derive(Clone)]
+pub(super) struct ParquetOpener {
+    pub(super) morselizer: ParquetMorselizer,
+}
+
+impl FileOpener for ParquetOpener {
+    fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
+        let future = ParquetOpenFuture::new(&self.morselizer, partitioned_file)?;
+        Ok(Box::pin(future))
+    }
+}
+
+/// Stateless Parquet morselizer implementation.
 ///
 /// Reading a Parquet file is a multi-stage process, with multiple CPU-intensive
 /// steps interspersed with I/O steps. The code in this module implements the steps
 /// as an explicit state machine -- see [`ParquetOpenState`] for details.
-pub(super) struct ParquetOpener {
+#[derive(Clone)]
+pub(super) struct ParquetMorselizer {
     /// Execution partition index
     pub(crate) partition_index: usize,
     /// Projection to apply on top of the table schema (i.e. can reference partition columns).
@@ -135,6 +155,23 @@ pub(super) struct ParquetOpener {
     pub max_predicate_cache_size: Option<usize>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
+}
+
+impl fmt::Debug for ParquetMorselizer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParquetMorselizer")
+            .field("partition_index", &self.partition_index)
+            .field("preserve_order", &self.preserve_order)
+            .field("enable_page_index", &self.enable_page_index)
+            .field("enable_bloom_filter", &self.enable_bloom_filter)
+            .finish()
+    }
+}
+
+impl Morselizer for ParquetMorselizer {
+    fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
+        Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
+    }
 }
 
 /// States for [`ParquetOpenFuture`]
@@ -216,6 +253,27 @@ enum ParquetOpenState {
     Done,
 }
 
+impl fmt::Debug for ParquetOpenState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = match self {
+            ParquetOpenState::Start { .. } => "Start",
+            #[cfg(feature = "parquet_encryption")]
+            ParquetOpenState::LoadEncryption(_) => "LoadEncryption",
+            ParquetOpenState::PruneFile(_) => "PruneFile",
+            ParquetOpenState::LoadMetadata(_) => "LoadMetadata",
+            ParquetOpenState::PrepareFilters(_) => "PrepareFilters",
+            ParquetOpenState::LoadPageIndex(_) => "LoadPageIndex",
+            ParquetOpenState::PruneWithStatistics(_) => "PruneWithStatistics",
+            ParquetOpenState::LoadBloomFilters(_) => "LoadBloomFilters",
+            ParquetOpenState::PruneWithBloomFilters(_) => "PruneWithBloomFilters",
+            ParquetOpenState::BuildStream(_) => "BuildStream",
+            ParquetOpenState::Ready(_) => "Ready",
+            ParquetOpenState::Done => "Done",
+        };
+        f.write_str(state)
+    }
+}
+
 struct PreparedParquetOpen {
     partition_index: usize,
     partitioned_file: PartitionedFile,
@@ -290,37 +348,13 @@ struct BloomFiltersLoadedParquetOpen {
     row_group_bloom_filters: Vec<BloomFilterStatistics>,
 }
 
-/// Implements state machine described in [`ParquetOpenState`]
-struct ParquetOpenFuture {
-    state: ParquetOpenState,
-}
-
-impl ParquetOpenFuture {
-    #[cfg(feature = "parquet_encryption")]
-    fn new(prepared: PreparedParquetOpen, encryption_context: EncryptionContext) -> Self {
-        Self {
-            state: ParquetOpenState::Start {
-                prepared: Box::new(prepared),
-                encryption_context: Arc::new(encryption_context),
-            },
-        }
-    }
-
-    #[cfg(not(feature = "parquet_encryption"))]
-    fn new(prepared: PreparedParquetOpen) -> Self {
-        Self {
-            state: ParquetOpenState::Start {
-                prepared: Box::new(prepared),
-            },
-        }
-    }
-}
-
 impl ParquetOpenState {
     /// Applies one CPU-only state transition.
     ///
     /// `Load*` states do not transition here and are returned unchanged so the
     /// driver loop can poll their inner futures separately.
+    ///
+    /// Implements state machine described in [`ParquetOpenState`]
     fn transition(self) -> Result<ParquetOpenState> {
         match self {
             ParquetOpenState::Start {
@@ -392,93 +426,258 @@ impl ParquetOpenState {
     }
 }
 
+/// Adapter for a [`MorselPlanner`] to the [`FileOpener`] API
+///
+/// Implements state machine described in [`ParquetOpenState`]
+struct ParquetOpenFuture {
+    planner: Box<dyn MorselPlanner>,
+    pending_io: Option<BoxFuture<'static, Result<()>>>,
+    ready_morsels: VecDeque<Box<dyn Morsel>>,
+}
+
+impl ParquetOpenFuture {
+    fn new(
+        morselizer: &ParquetMorselizer,
+        partitioned_file: PartitionedFile,
+    ) -> Result<Self> {
+        Ok(Self {
+            planner: morselizer.plan_file(partitioned_file)?,
+            pending_io: None,
+            ready_morsels: VecDeque::new(),
+        })
+    }
+}
+
 impl Future for ParquetOpenFuture {
     type Output = Result<BoxStream<'static, Result<RecordBatch>>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            let state = mem::replace(&mut self.state, ParquetOpenState::Done);
-            let mut state = state.transition()?;
+            // If waiting on IO, poll
+            if let Some(io_future) = self.pending_io.as_mut() {
+                ready!(io_future.poll_unpin(cx))?;
+                self.pending_io = None;
+            }
 
-            match state {
-                #[cfg(feature = "parquet_encryption")]
-                ParquetOpenState::LoadEncryption(mut future) => {
-                    state = match future.poll_unpin(cx) {
-                        Poll::Ready(result) => ParquetOpenState::PruneFile(result?),
-                        Poll::Pending => {
-                            self.state = ParquetOpenState::LoadEncryption(future);
-                            return Poll::Pending;
-                        }
-                    };
-                }
-                ParquetOpenState::LoadMetadata(mut future) => {
-                    state = match future.poll_unpin(cx) {
-                        Poll::Ready(result) => {
-                            ParquetOpenState::PrepareFilters(Box::new(result?))
-                        }
-                        Poll::Pending => {
-                            self.state = ParquetOpenState::LoadMetadata(future);
-                            return Poll::Pending;
-                        }
-                    };
-                }
-                ParquetOpenState::LoadPageIndex(mut future) => {
-                    state = match future.poll_unpin(cx) {
-                        Poll::Ready(result) => {
-                            ParquetOpenState::PruneWithStatistics(Box::new(result?))
-                        }
-                        Poll::Pending => {
-                            self.state = ParquetOpenState::LoadPageIndex(future);
-                            return Poll::Pending;
-                        }
-                    };
-                }
-                ParquetOpenState::LoadBloomFilters(mut future) => {
-                    state = match future.poll_unpin(cx) {
-                        Poll::Ready(result) => {
-                            ParquetOpenState::PruneWithBloomFilters(Box::new(result?))
-                        }
-                        Poll::Pending => {
-                            self.state = ParquetOpenState::LoadBloomFilters(future);
-                            return Poll::Pending;
-                        }
-                    };
-                }
-                ParquetOpenState::Ready(stream) => {
-                    return Poll::Ready(Ok(stream));
-                }
-                ParquetOpenState::Done => {
-                    return Poll::Ready(Ok(futures::stream::empty().boxed()));
-                }
+            // have a morsel ready to go, return that
+            if let Some(morsel) = self.ready_morsels.pop_front() {
+                return Poll::Ready(Ok(morsel.into_stream()));
+            }
 
-                // For all other states, loop again and try to transition
-                // immediately. All states are explicitly listed here to ensure any
-                // new states are handled correctly
-                ParquetOpenState::Start { .. } => {}
-                ParquetOpenState::PruneFile(_) => {}
-                ParquetOpenState::PrepareFilters(_) => {}
-                ParquetOpenState::PruneWithStatistics(_) => {}
-                ParquetOpenState::PruneWithBloomFilters(_) => {}
-                ParquetOpenState::BuildStream(_) => {}
+            // Planner did not produce any stream (for example, it pruned the entire file)
+            let Some(mut plan) = self.planner.plan()? else {
+                return Poll::Ready(Ok(futures::stream::empty().boxed()));
             };
 
-            self.state = state;
+            let child_planners = plan.take_planners();
+            if !child_planners.is_empty() {
+                return Poll::Ready(internal_err!(
+                    "Parquet FileOpener adapter does not support child morsel planners"
+                ));
+            }
+
+            self.ready_morsels = plan.take_morsels().into();
+
+            if let Some(io_future) = plan.take_io_future() {
+                self.pending_io = Some(io_future);
+            }
         }
     }
 }
 
-impl FileOpener for ParquetOpener {
-    fn open(&self, partitioned_file: PartitionedFile) -> Result<FileOpenFuture> {
-        let prepared = self.prepare_open_file(partitioned_file)?;
-        #[cfg(feature = "parquet_encryption")]
-        let future = ParquetOpenFuture::new(prepared, self.get_encryption_context());
-        #[cfg(not(feature = "parquet_encryption"))]
-        let future = ParquetOpenFuture::new(prepared);
-        Ok(Box::pin(future))
+/// Implements the Morsel API
+struct ParquetStreamMorsel {
+    stream: BoxStream<'static, Result<RecordBatch>>,
+}
+
+impl ParquetStreamMorsel {
+    fn new(stream: BoxStream<'static, Result<RecordBatch>>) -> Self {
+        Self { stream }
     }
 }
 
-impl ParquetOpener {
+impl fmt::Debug for ParquetStreamMorsel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParquetStreamMorsel")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Morsel for ParquetStreamMorsel {
+    fn into_stream(self: Box<Self>) -> BoxStream<'static, Result<RecordBatch>> {
+        self.stream
+    }
+}
+
+/// Stateful planner for opening a single parquet file via the morsel APIs.
+enum ParquetMorselPlanner {
+    /// Ready to perform CPU-only planning work.
+    Ready(ParquetOpenState),
+    /// Waiting for an I/O future to produce the next planner state.
+    ///
+    /// Callers must not call [`MorselPlanner::plan`] again until the
+    /// corresponding I/O future has completed and its result is ready to
+    /// receive from the channel.
+    ///
+    /// Doing so is a protocol violation and transitions the planner to
+    /// [`ParquetMorselPlanner::Errored`].
+    Waiting(Receiver<Result<ParquetOpenState>>),
+    /// Actively planning (this state should be replaced by end of the call to plan)
+    Planning,
+    /// An earlier planning attempt returned an error.
+    Errored,
+}
+
+impl fmt::Debug for ParquetMorselPlanner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready(state) => f
+                .debug_tuple("ParquetMorselPlanner::Ready")
+                .field(state)
+                .finish(),
+            Self::Waiting(_) => f
+                .debug_tuple("ParquetMorselPlanner::Waiting")
+                .field(&"<pending io>")
+                .finish(),
+            Self::Planning => f.debug_tuple("ParquetMorselPlanner::Planning").finish(),
+            Self::Errored => f.debug_tuple("ParquetMorselPlanner::Errored").finish(),
+        }
+    }
+}
+
+impl ParquetMorselPlanner {
+    fn try_new(morselizer: &ParquetMorselizer, file: PartitionedFile) -> Result<Self> {
+        let prepared = morselizer.prepare_open_file(file)?;
+        #[cfg(feature = "parquet_encryption")]
+        let state = ParquetOpenState::Start {
+            prepared: Box::new(prepared),
+            encryption_context: Arc::new(morselizer.get_encryption_context()),
+        };
+        #[cfg(not(feature = "parquet_encryption"))]
+        let state = ParquetOpenState::Start {
+            prepared: Box::new(prepared),
+        };
+        Ok(Self::Ready(state))
+    }
+
+    /// Schedule an I/O future that resolves to the planner's next owned state.
+    ///
+    /// This helper
+    ///
+    /// 1. creates a channel to send the next [`ParquetOpenState`] back to the
+    ///    planner once the I/O future completes,
+    ///
+    /// 2. transitions the planner into [`ParquetMorselPlanner::Waiting`]
+    ///
+    /// 3. returns a [`MorselPlan`] containing the boxed I/O future for the
+    ///    caller to poll.
+    ///
+    fn schedule_io<F>(&mut self, future: F) -> MorselPlan
+    where
+        F: Future<Output = Result<ParquetOpenState>> + Send + 'static,
+    {
+        let (output_for_future, output) = mpsc::channel();
+        let io_future = async move {
+            let next_state = future.await?;
+            output_for_future.send(Ok(next_state)).map_err(|e| {
+                DataFusionError::Execution(format!("failed to send planner output: {e}"))
+            })?;
+            Ok(())
+        }
+        .boxed();
+        *self = ParquetMorselPlanner::Waiting(output);
+        MorselPlan::new().with_io_future(io_future)
+    }
+}
+
+impl MorselPlanner for ParquetMorselPlanner {
+    fn plan(&mut self) -> Result<Option<MorselPlan>> {
+        loop {
+            let planner = mem::replace(self, ParquetMorselPlanner::Planning);
+            let state = match planner {
+                ParquetMorselPlanner::Ready(state) => state,
+                ParquetMorselPlanner::Waiting(output) => {
+                    output
+                        .try_recv()
+                        .map_err(|e| {
+                            // IO wasn't done
+                            *self = ParquetMorselPlanner::Errored;
+                            match e {
+                                TryRecvError::Empty => internal_datafusion_err!(
+                                    "planner polled before I/O completed"
+                                ),
+                                TryRecvError::Disconnected => internal_datafusion_err!(
+                                    "planner polled after I/O disconnected"
+                                ),
+                            }
+                        })?
+                        .inspect_err(|_| {
+                            // IO completed successfully, but the IO was an error
+                            *self = ParquetMorselPlanner::Errored;
+                        })?
+                }
+                ParquetMorselPlanner::Planning => {
+                    return internal_err!(
+                        "ParquetMorselPlanner::plan was re-entered before previous plan completed"
+                    );
+                }
+                ParquetMorselPlanner::Errored => {
+                    return internal_err!(
+                        "ParquetMorselPlanner::plan called after a previous error"
+                    );
+                }
+            };
+            // check for end of stream
+            if let ParquetOpenState::Done = state {
+                *self = ParquetMorselPlanner::Ready(ParquetOpenState::Done);
+                return Ok(None);
+            };
+
+            let state = state.transition().inspect_err(|_| {
+                *self = ParquetMorselPlanner::Errored;
+            })?;
+
+            match state {
+                #[cfg(feature = "parquet_encryption")]
+                ParquetOpenState::LoadEncryption(future) => {
+                    return Ok(Some(self.schedule_io(async move {
+                        Ok(ParquetOpenState::PruneFile(future.await?))
+                    })));
+                }
+                ParquetOpenState::LoadMetadata(future) => {
+                    return Ok(Some(self.schedule_io(async move {
+                        Ok(ParquetOpenState::PrepareFilters(Box::new(future.await?)))
+                    })));
+                }
+                ParquetOpenState::LoadPageIndex(future) => {
+                    return Ok(Some(self.schedule_io(async move {
+                        Ok(ParquetOpenState::PruneWithStatistics(Box::new(
+                            future.await?,
+                        )))
+                    })));
+                }
+                ParquetOpenState::LoadBloomFilters(future) => {
+                    return Ok(Some(self.schedule_io(async move {
+                        Ok(ParquetOpenState::PruneWithBloomFilters(Box::new(
+                            future.await?,
+                        )))
+                    })));
+                }
+                ParquetOpenState::Ready(stream) => {
+                    let morsels: Vec<Box<dyn Morsel>> =
+                        vec![Box::new(ParquetStreamMorsel::new(stream))];
+                    return Ok(Some(MorselPlan::new().with_morsels(morsels)));
+                }
+                ParquetOpenState::Done => return Ok(None),
+                cpu_state => {
+                    *self = ParquetMorselPlanner::Ready(cpu_state);
+                }
+            }
+        }
+    }
+}
+
+impl ParquetMorselizer {
     /// Perform the CPU-only setup for opening a parquet file.
     fn prepare_open_file(
         &self,
@@ -1447,7 +1646,7 @@ impl EncryptionContext {
     }
 }
 
-impl ParquetOpener {
+impl ParquetMorselizer {
     #[cfg(feature = "parquet_encryption")]
     fn get_encryption_context(&self) -> EncryptionContext {
         EncryptionContext::new(
@@ -1576,7 +1775,7 @@ fn should_enable_page_index(
 mod test {
     use std::sync::Arc;
 
-    use super::{ConstantColumns, constant_columns_from_stats};
+    use super::{ConstantColumns, ParquetMorselizer, constant_columns_from_stats};
     use crate::{DefaultParquetFileReaderFactory, RowGroupAccess, opener::ParquetOpener};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use bytes::{BufMut, BytesMut};
@@ -1731,11 +1930,12 @@ mod test {
                 ProjectionExprs::from_indices(&all_indices, &file_schema)
             };
 
-            ParquetOpener {
+            let morselizer = ParquetMorselizer {
                 partition_index: self.partition_index,
                 projection,
                 batch_size: self.batch_size,
                 limit: self.limit,
+                preserve_order: self.preserve_order,
                 predicate: self.predicate,
                 table_schema,
                 metadata_size_hint: self.metadata_size_hint,
@@ -1757,8 +1957,8 @@ mod test {
                 encryption_factory: None,
                 max_predicate_cache_size: self.max_predicate_cache_size,
                 reverse_row_groups: self.reverse_row_groups,
-                preserve_order: self.preserve_order,
-            }
+            };
+            ParquetOpener { morselizer }
         }
     }
 
