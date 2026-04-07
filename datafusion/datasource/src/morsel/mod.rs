@@ -28,6 +28,7 @@ use std::fmt::Debug;
 use crate::PartitionedFile;
 use arrow::array::RecordBatch;
 use datafusion_common::Result;
+use futures::Future;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
@@ -77,31 +78,99 @@ pub trait Morselizer: Send + Sync + Debug {
 /// ensure that CPU work doesn't block or slow down I/O work, but this is not
 /// strictly required by the API.
 pub trait MorselPlanner: Send + Debug {
-    /// Attempt to plan morsels. This may involve CPU work, such as parsing
-    /// parquet metadata and evaluating pruning predicates.
+    /// Advance this planner by one step.
+    ///
+    /// This may involve CPU work, such as parsing parquet metadata and
+    /// evaluating pruning predicates.
     ///
     /// It should NOT do any I/O work, such as reading from the file. If I/O is
-    /// required, the returned [`MorselPlan`] should contain a future that the
-    /// caller polls to drive the I/O work to completion. Once the future is
-    /// complete, the caller can call `plan` again to get the next morsels.
+    /// required, the returned [`MorselPlan`] may contain a
+    /// [`BlockedPlannerContinuation`], whose future owns the blocked continuation and
+    /// resolves to the next [`MorselPlanner`].
     ///
-    /// Note this function is **not async** to make it explicitly clear that if
-    /// I/O is required, it should be done in the returned `io_future`.
+    /// Note this function is **not async** to make it explicitly clear that I/O
+    /// must be driven by the returned [`BlockedPlannerContinuation`].
     ///
-    /// Returns `None` if the planner has no more work to do.
+    /// # Lifecycle
     ///
-    /// # Empty Morsel Plans
+    /// A planner moves between CPU-ready and I/O-blocked states:
     ///
-    /// It may return `None`, which means no batches will be read from the file
-    /// (e.g. due to late-pruning based on statistics).
+    /// ```text
+    /// Box<dyn MorselPlanner>
+    ///     |
+    ///     | step()
+    ///     v
+    /// PlannerStep::Ready(MorselPlan)
+    ///     |
+    ///     | may contain:
+    ///     | - morsels
+    ///     | - child planners
+    ///     | - ready_continuation
+    ///     | - blocked_continuation
+    ///     v
+    /// BlockedPlannerContinuation
+    ///     |
+    ///     | poll / run I/O
+    ///     v
+    /// Box<dyn MorselPlanner>
+    /// ```
     ///
-    /// # Output Ordering
-    ///
-    /// See the comments on [`MorselPlan`] for the logical output order.
-    fn plan(&mut self) -> Result<Option<MorselPlan>>;
+    /// Returns [`PlannerStep::Done`] if the planner has no more work to do.
+    fn step(self: Box<Self>) -> Result<PlannerStep>;
 }
 
-/// Return result of [`MorselPlanner::plan`].
+/// Result of advancing a [`MorselPlanner`].
+pub enum PlannerStep {
+    /// CPU work produced morsels and/or child planners immediately.
+    Ready(MorselPlan),
+    /// The planner has no more work to do.
+    Done,
+}
+
+impl Debug for PlannerStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ready(plan) => f.debug_tuple("PlannerStep::Ready").field(plan).finish(),
+            Self::Done => f.debug_tuple("PlannerStep::Done").finish(),
+        }
+    }
+}
+
+/// A named future that owns the blocked continuation of a [`MorselPlanner`].
+///
+/// This is not just "some I/O future". It is the suspended remainder of the
+/// planner state machine: once the required I/O completes, polling this future
+/// yields the next CPU-ready planner.
+pub struct BlockedPlannerContinuation {
+    future: BoxFuture<'static, Result<Box<dyn MorselPlanner>>>,
+}
+
+impl BlockedPlannerContinuation {
+    /// Create a new blocked continuation future.
+    pub fn new(future: BoxFuture<'static, Result<Box<dyn MorselPlanner>>>) -> Self {
+        Self { future }
+    }
+}
+
+impl Debug for BlockedPlannerContinuation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockedPlannerContinuation")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Future for BlockedPlannerContinuation {
+    type Output = Result<Box<dyn MorselPlanner>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.future.as_mut().poll(cx)
+    }
+}
+
+/// Return result of [`PlannerStep::Ready`].
 ///
 /// # Logical Ordering
 ///
@@ -109,18 +178,49 @@ pub trait MorselPlanner: Send + Debug {
 /// a [`MorselPlanner`] is logically defined as follows:
 /// 1. All morsels that are directly produced
 /// 2. Recursively, all morsels produced by the returned `planners`
+///
+/// # Scheduler View
+///
+/// A plan may hand the scheduler four kinds of work at once:
+///
+/// ```text
+/// MorselPlan
+/// ├── morsels: ready output work
+/// ├── planners: ready child CPU work
+/// ├── ready_continuation: same planner, still CPU-ready
+/// └── blocked_continuation: same planner, blocked on I/O
+/// ```
+///
+/// This lets a single `step()` return ready work immediately while also handing
+/// off the blocked remainder to a more concurrent I/O executor.
 #[derive(Default)]
 pub struct MorselPlan {
     /// Any morsels that are ready for processing.
     morsels: Vec<Box<dyn Morsel>>,
     /// Any newly-created planners that are ready for CPU work.
     planners: Vec<Box<dyn MorselPlanner>>,
-    /// A future that will drive any I/O work to completion.
-    ///
-    /// DataFusion will poll this future occasionally to drive the I/O work to
-    /// completion. Once the future resolves, DataFusion will call `plan` again
-    /// to get the next morsels.
-    io_future: Option<BoxFuture<'static, Result<()>>>,
+    /// The same planner's immediate CPU-ready continuation.
+    ready_continuation: Option<Box<dyn MorselPlanner>>,
+    /// A blocked continuation that can be polled independently while ready work
+    /// is being consumed.
+    blocked_continuation: Option<BlockedPlannerContinuation>,
+}
+
+impl Debug for MorselPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MorselPlan")
+            .field("morsels", &self.morsels.len())
+            .field("planners", &self.planners.len())
+            .field(
+                "ready_continuation",
+                &self.ready_continuation.as_ref().map(|_| "<planner>"),
+            )
+            .field(
+                "blocked_continuation",
+                &self.blocked_continuation.as_ref().map(|_| "<blocked>"),
+            )
+            .finish()
+    }
 }
 
 impl MorselPlan {
@@ -141,9 +241,21 @@ impl MorselPlan {
         self
     }
 
-    /// Set the pending I/O future.
-    pub fn with_io_future(mut self, io_future: BoxFuture<'static, Result<()>>) -> Self {
-        self.io_future = Some(io_future);
+    /// Set the same planner's immediate CPU-ready continuation.
+    pub fn with_ready_continuation(
+        mut self,
+        ready_continuation: Box<dyn MorselPlanner>,
+    ) -> Self {
+        self.ready_continuation = Some(ready_continuation);
+        self
+    }
+
+    /// Set the blocked continuation that can be polled independently.
+    pub fn with_blocked_continuation(
+        mut self,
+        blocked_continuation: BlockedPlannerContinuation,
+    ) -> Self {
+        self.blocked_continuation = Some(blocked_continuation);
         self
     }
 
@@ -157,18 +269,23 @@ impl MorselPlan {
         std::mem::take(&mut self.planners)
     }
 
-    /// Take the pending I/O future, if any.
-    pub fn take_io_future(&mut self) -> Option<BoxFuture<'static, Result<()>>> {
-        self.io_future.take()
+    /// Take the same planner's immediate CPU-ready continuation, if any.
+    pub fn take_ready_continuation(&mut self) -> Option<Box<dyn MorselPlanner>> {
+        self.ready_continuation.take()
     }
 
-    /// Set the pending I/O future.
-    pub fn set_io_future(&mut self, io_future: BoxFuture<'static, Result<()>>) {
-        self.io_future = Some(io_future);
+    /// Take the blocked continuation, if any.
+    pub fn take_blocked_continuation(&mut self) -> Option<BlockedPlannerContinuation> {
+        self.blocked_continuation.take()
     }
 
-    /// Returns `true` if this plan contains an I/O future.
-    pub fn has_io_future(&self) -> bool {
-        self.io_future.is_some()
+    /// Returns `true` if this plan contains a CPU-ready continuation.
+    pub fn has_ready_continuation(&self) -> bool {
+        self.ready_continuation.is_some()
+    }
+
+    /// Returns `true` if this plan contains a blocked continuation.
+    pub fn has_blocked_continuation(&self) -> bool {
+        self.blocked_continuation.is_some()
     }
 }
