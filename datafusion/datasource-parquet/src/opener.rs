@@ -473,6 +473,7 @@ impl Future for ParquetOpenFuture {
                 return Poll::Ready(Ok(morsel.into_stream()));
             }
 
+            // Planner did not produce any stream (for example, it pruned the entire file)
             let Some(planner) = self.ready_planners.pop_front() else {
                 return Poll::Ready(Ok(futures::stream::empty().boxed()));
             };
