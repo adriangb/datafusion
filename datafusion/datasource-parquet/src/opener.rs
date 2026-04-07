@@ -430,8 +430,8 @@ impl ParquetOpenState {
 ///
 /// Implements state machine described in [`ParquetOpenState`]
 struct ParquetOpenFuture {
-    planner: Option<Box<dyn MorselPlanner>>,
-    blocked_continuation: Option<BlockedPlannerContinuation>,
+    ready_planners: VecDeque<Box<dyn MorselPlanner>>,
+    blocked_continuations: VecDeque<BlockedPlannerContinuation>,
     ready_morsels: VecDeque<Box<dyn Morsel>>,
 }
 
@@ -441,8 +441,8 @@ impl ParquetOpenFuture {
         partitioned_file: PartitionedFile,
     ) -> Result<Self> {
         Ok(Self {
-            planner: Some(morselizer.plan_file(partitioned_file)?),
-            blocked_continuation: None,
+            ready_planners: vec![morselizer.plan_file(partitioned_file)?].into(),
+            blocked_continuations: VecDeque::new(),
             ready_morsels: VecDeque::new(),
         })
     }
@@ -453,12 +453,19 @@ impl Future for ParquetOpenFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            // If waiting on IO, poll the blocked continuation until it yields
-            // the next CPU-ready planner.
-            if let Some(blocked_continuation) = self.blocked_continuation.as_mut() {
-                let planner = ready!(blocked_continuation.poll_unpin(cx))?;
-                self.blocked_continuation = None;
-                self.planner = Some(planner);
+            // If waiting on IO, poll the oldest blocked continuation until it
+            // yields the next CPU-ready planner.
+            if let Some(mut blocked_continuation) = self.blocked_continuations.pop_front() {
+                match blocked_continuation.poll_unpin(cx) {
+                    Poll::Pending => {
+                        self.blocked_continuations
+                            .push_front(blocked_continuation);
+                    }
+                    Poll::Ready(Ok(planner)) => {
+                        self.ready_planners.push_back(planner);
+                    }
+                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                }
             }
 
             // have a morsel ready to go, return that
@@ -466,7 +473,7 @@ impl Future for ParquetOpenFuture {
                 return Poll::Ready(Ok(morsel.into_stream()));
             }
 
-            let Some(planner) = self.planner.take() else {
+            let Some(planner) = self.ready_planners.pop_front() else {
                 return Poll::Ready(Ok(futures::stream::empty().boxed()));
             };
 
@@ -480,8 +487,13 @@ impl Future for ParquetOpenFuture {
                     }
 
                     self.ready_morsels = plan.take_morsels().into();
-                    self.planner = plan.take_ready_continuation();
-                    self.blocked_continuation = plan.take_blocked_continuation();
+                    if let Some(ready_continuation) = plan.take_ready_continuation() {
+                        self.ready_planners.push_back(ready_continuation);
+                    }
+                    if let Some(blocked_continuation) = plan.take_blocked_continuation() {
+                        self.blocked_continuations
+                            .push_back(blocked_continuation);
+                    }
                 }
                 PlannerStep::Done => {
                     return Poll::Ready(Ok(futures::stream::empty().boxed()));
