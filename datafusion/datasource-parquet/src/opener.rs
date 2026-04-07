@@ -471,6 +471,12 @@ impl Future for ParquetOpenFuture {
                 return Poll::Ready(Ok(morsel.into_stream()));
             }
 
+            // If all remaining work is blocked on I/O, wait for it to yield the
+            // next planner rather than incorrectly reporting an empty stream.
+            if self.ready_planners.is_empty() && !self.pending_io.is_empty() {
+                return Poll::Pending;
+            }
+
             // Planner did not produce any stream (for example, it pruned the entire file)
             let Some(planner) = self.ready_planners.pop_front() else {
                 return Poll::Ready(Ok(futures::stream::empty().boxed()));
