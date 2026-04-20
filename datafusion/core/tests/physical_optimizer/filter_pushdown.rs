@@ -1031,7 +1031,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1049,7 +1049,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
           -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -1076,14 +1076,14 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     #[cfg(not(feature = "force_hash_collisions"))]
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
     -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ CASE hash_repartition % 12 WHEN 5 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) WHEN 8 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) ELSE false END ]
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ CASE hash_repartition % 12 WHEN 5 THEN a@0 >= ab AND a@0 <= ab AND b@1 >= bb AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:ab,c1:bb}]) WHEN 8 THEN a@0 >= aa AND a@0 <= aa AND b@1 >= ba AND b@1 <= ba AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}]) ELSE false END ])
     "
     );
 
@@ -1231,7 +1231,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // expect the predicate to be pushed down into the probe side DataSource
     insta::assert_snapshot!(
         OptimizationTest::new(Arc::clone(&plan), FilterPushdown::new_post_optimization(), true),
-        @r"
+        @"
     OptimizationTest:
       input:
         - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
@@ -1247,7 +1247,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
           -     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
           -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
           -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+          -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -1273,13 +1273,13 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
     // Now check what our filter looks like
     insta::assert_snapshot!(
         format!("{}", format_plan_for_test(&plan)),
-        @r"
+        @"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
     -     HashJoinExec: mode=CollectLeft, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -       DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=true
     -       RepartitionExec: partitioning=Hash([a@0, b@1], 12), input_partitions=1
-    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ]
+    -         DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, e], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ a@0 >= aa AND a@0 <= ab AND b@1 >= ba AND b@1 <= bb AND struct(a@0, b@1) IN (SET) ([{c0:aa,c1:ba}, {c0:ab,c1:bb}]) ])
     "
     );
 
@@ -2404,12 +2404,12 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
 
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ empty ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ empty ])
     "
     );
 
@@ -2429,12 +2429,12 @@ async fn test_hashjoin_dynamic_filter_all_partitions_empty() {
     // Test that filters are pushed down correctly to each side of the join
     insta::assert_snapshot!(
         format_plan_for_test(&plan),
-        @r"
+        @"
     - HashJoinExec: mode=Partitioned, join_type=Inner, on=[(a@0, a@0), (b@1, b@1)]
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
     -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true
     -   RepartitionExec: partitioning=Hash([a@0, b@1], 4), input_partitions=1
-    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=DynamicFilter [ false ]
+    -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b], file_type=test, pushdown_supported=true, predicate=Optional(DynamicFilter [ false ])
     "
     );
 }
@@ -2954,18 +2954,28 @@ async fn test_discover_dynamic_filters_via_expressions_api() {
     use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
     use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
 
+    fn count_in_expr(expr: &dyn PhysicalExpr) -> usize {
+        let mut count = 0;
+        if expr.downcast_ref::<DynamicFilterPhysicalExpr>().is_some() {
+            count += 1;
+        }
+        for child in expr.children() {
+            count += count_in_expr(child.as_ref());
+        }
+        count
+    }
+
     fn count_dynamic_filters(plan: &Arc<dyn ExecutionPlan>) -> usize {
         let mut count = 0;
 
-        // Check expressions from this node using apply_expressions
+        // Check expressions from this node using apply_expressions.
+        // Walk each expression subtree to find DynamicFilterPhysicalExpr even
+        // when wrapped (e.g. by OptionalFilterPhysicalExpr).
         let _ = plan.apply_expressions(&mut |expr| {
-            if let Some(_df) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
-                count += 1;
-            }
+            count += count_in_expr(expr);
             Ok(TreeNodeRecursion::Continue)
         });
 
-        // Recursively visit children
         for child in plan.children() {
             count += count_dynamic_filters(child);
         }
