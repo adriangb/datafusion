@@ -136,7 +136,7 @@ pub(crate) struct DatafusionArrowPredicate {
     /// post-scan path reports in `apply_post_scan_filters_with_stats`
     /// (see `opener.rs::post_scan_other_bytes_per_row`); if the two
     /// paths disagreed, the tracker would rank row-filter and post-scan
-    /// candidates on incomparable axes and mis-promote or mis-demote.
+    /// candidates on incomparable axes and wrongly promote or demote them.
     other_projected_bytes_per_row: f64,
     /// Mid-stream "drop" flag, shared with the
     /// [`crate::selectivity::SelectivityTracker`]. The tracker flips this
