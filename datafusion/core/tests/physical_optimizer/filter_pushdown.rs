@@ -2755,8 +2755,8 @@ async fn test_hashjoin_hash_table_pushdown_collect_left() {
     );
 }
 
-// Not portable to sqllogictest: asserts on `HashJoinExec::dynamic_filter_for_test().is_used()`
-// which is a debug-only API. The observable behavior (probe-side scan
+// Not portable to sqllogictest: asserts on `HashJoinExec::dynamic_filter().is_used()`
+// which is a Rust API. The observable behavior (probe-side scan
 // receiving the dynamic filter when the data source supports it) is
 // already covered by the simpler CollectLeft port in push_down_filter_parquet.slt;
 // the with_support(false) branch has no SQL analog (parquet always supports
@@ -2835,7 +2835,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_is_used() {
 
         // Verify that a dynamic filter was created
         let dynamic_filter = hash_join
-            .dynamic_filter_for_test()
+            .dynamic_filter()
             .expect("Dynamic filter should be created");
 
         // Verify that is_used() returns the expected value based on probe side support.

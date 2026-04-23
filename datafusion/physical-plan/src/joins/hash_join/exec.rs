@@ -490,8 +490,17 @@ impl HashJoinExecBuilder {
         })
     }
 
-    fn with_dynamic_filter(mut self, filter: Option<HashJoinExecDynamicFilter>) -> Self {
-        self.exec.dynamic_filter = filter;
+    /// Attach a pre-existing [`DynamicFilterPhysicalExpr`] to this
+    /// `HashJoinExec`. The filter's shared mutable state is preserved; the
+    /// build-side update coordinator is reinitialized per execution.
+    ///
+    /// Callers typically get this filter from a proto round-trip so that the
+    /// `HashJoinExec` and any pushed-down scan site observe the same `inner`.
+    pub fn with_dynamic_filter(mut self, filter: Arc<DynamicFilterPhysicalExpr>) -> Self {
+        self.exec.dynamic_filter = Some(HashJoinExecDynamicFilter {
+            filter,
+            build_accumulator: OnceLock::new(),
+        });
         self
     }
 }
@@ -902,12 +911,10 @@ impl HashJoinExec {
         self.null_equality
     }
 
-    /// Get the dynamic filter expression for testing purposes.
-    /// Returns `None` if no dynamic filter has been set.
-    ///
-    /// This method is intended for testing only and should not be used in production code.
-    #[doc(hidden)]
-    pub fn dynamic_filter_for_test(&self) -> Option<&Arc<DynamicFilterPhysicalExpr>> {
+    /// The [`DynamicFilterPhysicalExpr`] this join maintains at runtime, if
+    /// any. Updated on build completion and observed by consumers that had
+    /// the filter pushed down into them.
+    pub fn dynamic_filter(&self) -> Option<&Arc<DynamicFilterPhysicalExpr>> {
         self.dynamic_filter.as_ref().map(|df| &df.filter)
     }
 
@@ -1674,10 +1681,7 @@ impl ExecutionPlan for HashJoinExec {
                 // We successfully pushed down our self filter - we need to make a new node with the dynamic filter
                 let new_node = self
                     .builder()
-                    .with_dynamic_filter(Some(HashJoinExecDynamicFilter {
-                        filter: dynamic_filter,
-                        build_accumulator: OnceLock::new(),
-                    }))
+                    .with_dynamic_filter(dynamic_filter)
                     .build_exec()?;
                 result = result.with_updated_node(new_node);
             }
