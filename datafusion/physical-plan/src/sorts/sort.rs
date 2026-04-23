@@ -933,6 +933,25 @@ impl SortExec {
         }
     }
 
+    /// Install a pre-existing [`DynamicFilterPhysicalExpr`] as this sort's
+    /// TopK dynamic filter, replacing any auto-created one.
+    ///
+    /// Used on the deserialize side of a proto round-trip so the `SortExec`
+    /// and any pushed-down scan site observe the same `inner`. Only
+    /// meaningful when combined with [`Self::with_fetch`]; the filter is
+    /// consulted during TopK execution.
+    pub fn with_dynamic_filter(mut self, filter: Arc<DynamicFilterPhysicalExpr>) -> Self {
+        self.filter = Some(Arc::new(RwLock::new(TopKDynamicFilters::new(filter))));
+        self
+    }
+
+    /// Return this sort's TopK dynamic filter, if any. Set by
+    /// [`Self::with_fetch`] (auto-created) or [`Self::with_dynamic_filter`]
+    /// (caller-supplied).
+    pub fn dynamic_filter(&self) -> Option<Arc<DynamicFilterPhysicalExpr>> {
+        self.filter.as_ref().map(|f| f.read().expr())
+    }
+
     /// Modify how many rows to include in the result
     ///
     /// If None, then all rows will be returned, in sorted order.
