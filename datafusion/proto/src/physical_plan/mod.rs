@@ -56,6 +56,7 @@ use datafusion_functions_table::generate_series::{
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::async_scalar_function::AsyncFuncExpr;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::{LexOrdering, LexRequirement, PhysicalExprRef};
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
@@ -73,8 +74,8 @@ use datafusion_physical_plan::expressions::PhysicalSortExpr;
 use datafusion_physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::joins::{
-    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
-    StreamJoinPartitionMode, SymmetricHashJoinExec,
+    CrossJoinExec, HashJoinExec, HashJoinExecBuilder, NestedLoopJoinExec, PartitionMode,
+    SortMergeJoinExec, StreamJoinPartitionMode, SymmetricHashJoinExec,
 };
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use datafusion_physical_plan::memory::LazyMemoryExec;
@@ -1407,17 +1408,31 @@ impl protobuf::PhysicalPlanNode {
         } else {
             None
         };
-        Ok(Arc::new(HashJoinExec::try_new(
-            left,
-            right,
-            on,
-            filter,
-            &join_type.into(),
-            projection,
-            partition_mode,
-            null_equality.into(),
-            hashjoin.null_aware,
-        )?))
+        let mut builder = HashJoinExecBuilder::new(left, right, on, join_type.into())
+            .with_filter(filter)
+            .with_partition_mode(partition_mode)
+            .with_null_equality(null_equality.into())
+            .with_null_aware(hashjoin.null_aware)
+            .with_projection(projection);
+
+        if let Some(proto_filter) = &hashjoin.dynamic_filter {
+            let filter_expr = proto_converter.proto_to_physical_expr(
+                proto_filter,
+                ctx,
+                &right_schema,
+                codec,
+            )?;
+            let df = Arc::downcast::<DynamicFilterPhysicalExpr>(filter_expr).map_err(
+                |_| {
+                    proto_error(
+                        "HashJoinExec.dynamic_filter was not a DynamicFilterPhysicalExpr",
+                    )
+                },
+            )?;
+            builder = builder.with_dynamic_filter(df);
+        }
+
+        Ok(Arc::new(builder.build()?))
     }
 
     fn try_into_symmetric_hash_join_physical_plan(
@@ -2465,6 +2480,14 @@ impl protobuf::PhysicalPlanNode {
             PartitionMode::Auto => protobuf::PartitionMode::Auto,
         };
 
+        let dynamic_filter = exec
+            .dynamic_filter()
+            .map(|df| {
+                let df_expr: Arc<dyn PhysicalExpr> = Arc::clone(df) as _;
+                proto_converter.physical_expr_to_proto(&df_expr, codec)
+            })
+            .transpose()?;
+
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
                 protobuf::HashJoinExecNode {
@@ -2479,6 +2502,7 @@ impl protobuf::PhysicalPlanNode {
                         v.iter().map(|x| *x as u32).collect::<Vec<u32>>()
                     }),
                     null_aware: exec.null_aware,
+                    dynamic_filter,
                 },
             ))),
         })

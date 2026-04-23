@@ -1776,6 +1776,11 @@ pub struct HashJoinExecNode {
     pub projection: ::prost::alloc::vec::Vec<u32>,
     #[prost(bool, tag = "10")]
     pub null_aware: bool,
+    /// Dynamic filter built on the build side and observed by pushed-down scans.
+    /// Carried here so receiver's HashJoinExec shares mutable state with the
+    /// scan sites via the `DeduplicatingProtoConverter`'s expr_id cache.
+    #[prost(message, optional, tag = "11")]
+    pub dynamic_filter: ::core::option::Option<PhysicalExprNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SymmetricHashJoinExecNode {

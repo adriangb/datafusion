@@ -8674,6 +8674,9 @@ impl serde::Serialize for HashJoinExecNode {
         if self.null_aware {
             len += 1;
         }
+        if self.dynamic_filter.is_some() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.HashJoinExecNode", len)?;
         if let Some(v) = self.left.as_ref() {
             struct_ser.serialize_field("left", v)?;
@@ -8708,6 +8711,9 @@ impl serde::Serialize for HashJoinExecNode {
         if self.null_aware {
             struct_ser.serialize_field("nullAware", &self.null_aware)?;
         }
+        if let Some(v) = self.dynamic_filter.as_ref() {
+            struct_ser.serialize_field("dynamicFilter", v)?;
+        }
         struct_ser.end()
     }
 }
@@ -8731,6 +8737,8 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
             "projection",
             "null_aware",
             "nullAware",
+            "dynamic_filter",
+            "dynamicFilter",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -8744,6 +8752,7 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
             Filter,
             Projection,
             NullAware,
+            DynamicFilter,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -8774,6 +8783,7 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
                             "filter" => Ok(GeneratedField::Filter),
                             "projection" => Ok(GeneratedField::Projection),
                             "nullAware" | "null_aware" => Ok(GeneratedField::NullAware),
+                            "dynamicFilter" | "dynamic_filter" => Ok(GeneratedField::DynamicFilter),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -8802,6 +8812,7 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
                 let mut filter__ = None;
                 let mut projection__ = None;
                 let mut null_aware__ = None;
+                let mut dynamic_filter__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::Left => {
@@ -8861,6 +8872,12 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
                             }
                             null_aware__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::DynamicFilter => {
+                            if dynamic_filter__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dynamicFilter"));
+                            }
+                            dynamic_filter__ = map_.next_value()?;
+                        }
                     }
                 }
                 Ok(HashJoinExecNode {
@@ -8873,6 +8890,7 @@ impl<'de> serde::Deserialize<'de> for HashJoinExecNode {
                     filter: filter__,
                     projection: projection__.unwrap_or_default(),
                     null_aware: null_aware__.unwrap_or_default(),
+                    dynamic_filter: dynamic_filter__,
                 })
             }
         }

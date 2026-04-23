@@ -1196,6 +1196,10 @@ message HashJoinExecNode {
   JoinFilter filter = 8;
   repeated uint32 projection = 9;
   bool null_aware = 10;
+  // Dynamic filter built on the build side and observed by pushed-down scans.
+  // Carried here so receiver's HashJoinExec shares mutable state with the
+  // scan sites via the `DeduplicatingProtoConverter`'s expr_id cache.
+  optional PhysicalExprNode dynamic_filter = 11;
 }
 
 enum StreamPartitionMode {
