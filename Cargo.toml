@@ -55,6 +55,7 @@ members = [
     "datafusion/sql",
     "datafusion/sqllogictest",
     "datafusion/substrait",
+    "datafusion/tests",
     "datafusion/wasmtest",
     "datafusion-cli",
     "datafusion-examples",

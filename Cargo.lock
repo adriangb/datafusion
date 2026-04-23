@@ -2722,6 +2722,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-tests"
+version = "53.1.0"
+dependencies = [
+ "arrow",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-proto",
+ "insta",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "datafusion-wasmtest"
 version = "53.1.0"
 dependencies = [
