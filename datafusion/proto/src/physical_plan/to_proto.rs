@@ -32,8 +32,8 @@ use datafusion_datasource_json::file_format::JsonSink;
 use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
 use datafusion_physical_plan::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr,
@@ -257,9 +257,7 @@ pub fn serialize_physical_expr_with_converter(
     codec: &dyn PhysicalExtensionCodec,
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<protobuf::PhysicalExprNode> {
-    // Snapshot the expr in case it has dynamic predicate state so
-    // it can be serialized
-    let expr = snapshot_physical_expr(Arc::clone(value))?;
+    let expr = Arc::clone(value);
 
     // HashTableLookupExpr is used for dynamic filter pushdown in hash joins.
     // It contains an Arc<dyn JoinHashMapType> (the build-side hash table) which
@@ -283,6 +281,29 @@ pub fn serialize_physical_expr_with_converter(
         return Ok(protobuf::PhysicalExprNode {
             expr_id: None,
             expr_type: Some(protobuf::physical_expr_node::ExprType::Literal(value)),
+        });
+    }
+
+    if let Some(df) = expr.downcast_ref::<DynamicFilterPhysicalExpr>() {
+        // Emit this site's view: `children()` as observed here (remapped if
+        // this wrapper went through `with_new_children`) and `current()` with
+        // the same remapping applied. Identity for linking multiple sites is
+        // carried on the enclosing `PhysicalExprNode.expr_id` by the
+        // deduplicating converter via `PhysicalExpr::expression_id`.
+        let current_expr = proto_converter
+            .physical_expr_to_proto(&df.current()?, codec)
+            .map(Box::new)?;
+        let children = serialize_physical_exprs(df.children(), codec, proto_converter)?;
+        return Ok(protobuf::PhysicalExprNode {
+            expr_id: None,
+            expr_type: Some(protobuf::physical_expr_node::ExprType::DynamicFilter(
+                Box::new(protobuf::PhysicalDynamicFilterExprNode {
+                    current_expr: Some(current_expr),
+                    children,
+                    generation: df.snapshot_generation(),
+                    is_complete: df.is_complete(),
+                }),
+            )),
         });
     }
 

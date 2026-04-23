@@ -1317,7 +1317,7 @@ pub struct PhysicalExprNode {
     pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22"
     )]
     pub expr_type: ::core::option::Option<physical_expr_node::ExprType>,
 }
@@ -1370,6 +1370,8 @@ pub mod physical_expr_node {
         UnknownColumn(super::UnknownColumn),
         #[prost(message, tag = "21")]
         HashExpr(super::PhysicalHashExprNode),
+        #[prost(message, tag = "22")]
+        DynamicFilter(::prost::alloc::boxed::Box<super::PhysicalDynamicFilterExprNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1571,6 +1573,42 @@ pub struct PhysicalHashExprNode {
     pub seed0: u64,
     #[prost(string, tag = "6")]
     pub description: ::prost::alloc::string::String,
+}
+/// A DynamicFilterPhysicalExpr: a filter whose inner expression is shared,
+/// mutable state owned by a producer (e.g. a HashJoinExec build side).
+///
+/// Multiple `PhysicalExprNode`s in a plan can reference the same dynamic filter;
+/// they are linked on the deserialize side via `id`. The first site to be
+/// deserialized becomes the canonical wrapper and is cached; each subsequent
+/// site overlays its own `children` on the canonical via
+/// `PhysicalExpr::with_new_children`, preserving the canonical's mutable state
+/// while keeping per-site projections.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PhysicalDynamicFilterExprNode {
+    /// The filter expression as visible at this call site (equivalent to calling
+    /// `current()` on the `DynamicFilterPhysicalExpr`, with any per-site child
+    /// remapping already applied).
+    ///
+    /// Identity (for linking multiple call sites to the same shared state) is
+    /// carried on the enclosing `PhysicalExprNode.expr_id` — populated by the
+    /// `DeduplicatingProtoConverter` from `PhysicalExpr::expression_id`.
+    #[prost(message, optional, boxed, tag = "1")]
+    pub current_expr: ::core::option::Option<
+        ::prost::alloc::boxed::Box<PhysicalExprNode>,
+    >,
+    /// The children visible at this call site — what `PhysicalExpr::children`
+    /// returns. These are the `current_expr`'s leaf column references.
+    #[prost(message, repeated, tag = "2")]
+    pub children: ::prost::alloc::vec::Vec<PhysicalExprNode>,
+    /// Generation counter captured at serialization time. The receiver installs
+    /// it on the reconstructed `Inner` so subsequent local `update()` calls keep
+    /// a monotonic sequence. Does not propagate live updates from the sender.
+    #[prost(uint64, tag = "3")]
+    pub generation: u64,
+    /// Whether the sender had already called `mark_complete()` when this
+    /// expression was serialized.
+    #[prost(bool, tag = "4")]
+    pub is_complete: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FilterExecNode {

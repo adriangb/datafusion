@@ -413,6 +413,21 @@ pub trait PhysicalExpr: Any + Send + Sync + Display + Debug + DynEq + DynHash {
         0
     }
 
+    /// Return a stable, globally-unique identifier for this `PhysicalExpr`, if it has one.
+    ///
+    /// Expressions that carry shared mutable state (e.g. `DynamicFilterPhysicalExpr`)
+    /// use this to preserve their identity across proto serialize/deserialize round-trips
+    /// so that multiple references in a plan continue to point at the same state.
+    ///
+    /// The id must be stable across [`PhysicalExpr::with_new_children`] — it follows the
+    /// underlying shared state, not the outer wrapper.
+    ///
+    /// Default is `None`: the expression has no identity worth preserving across a
+    /// serialization boundary, and consumers should fall back to structural equality.
+    fn expression_id(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns true if the expression node is volatile, i.e. whether it can return
     /// different results when evaluated multiple times with the same input.
     ///

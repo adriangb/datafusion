@@ -2746,75 +2746,6 @@ fn test_expression_deduplication() -> Result<()> {
     Ok(())
 }
 
-/// Test that expression deduplication correctly shares Arcs for identical expressions.
-/// This test verifies the core deduplication behavior.
-#[test]
-fn test_expression_deduplication_arc_sharing() -> Result<()> {
-    use datafusion_proto::bytes::{
-        physical_plan_from_bytes_with_proto_converter,
-        physical_plan_to_bytes_with_proto_converter,
-    };
-
-    let field_a = Field::new("a", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a column expression
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-
-    // Create a projection that uses the SAME Arc twice
-    // After roundtrip, both should point to the same Arc
-    let projection_exprs = vec![
-        ProjectionExpr {
-            expr: Arc::clone(&col_expr),
-            alias: "a1".to_string(),
-        },
-        ProjectionExpr {
-            expr: Arc::clone(&col_expr), // Same Arc!
-            alias: "a2".to_string(),
-        },
-    ];
-
-    let input = Arc::new(EmptyExec::new(schema));
-    let exec_plan = Arc::new(ProjectionExec::try_new(projection_exprs, input)?);
-
-    let ctx = SessionContext::new();
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // Serialize
-    let bytes = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
-        &codec,
-        &proto_converter,
-    )?;
-
-    // Deserialize with a fresh converter
-    let deser_converter = DeduplicatingProtoConverter {};
-    let result_plan = physical_plan_from_bytes_with_proto_converter(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &deser_converter,
-    )?;
-
-    // Get the projection from the result
-    let projection = result_plan
-        .downcast_ref::<ProjectionExec>()
-        .expect("Expected ProjectionExec");
-
-    let exprs: Vec<_> = projection.expr().iter().collect();
-    assert_eq!(exprs.len(), 2);
-
-    // The key test: both expressions should point to the same Arc after deduplication
-    // This is because they were the same Arc before serialization
-    assert!(
-        Arc::ptr_eq(&exprs[0].expr, &exprs[1].expr),
-        "Expected both expressions to share the same Arc after deduplication"
-    );
-
-    Ok(())
-}
-
 /// Test backward compatibility: protos without expr_id should still deserialize correctly.
 #[test]
 fn test_backward_compatibility_no_expr_id() -> Result<()> {
@@ -2854,270 +2785,311 @@ fn test_backward_compatibility_no_expr_id() -> Result<()> {
     Ok(())
 }
 
-/// Test that deduplication works within a single plan deserialization and that
-/// separate deserializations produce independent expressions (no cross-operation sharing).
+/// Round-trip a plan whose predicate contains two `DynamicFilterPhysicalExpr`
+/// wrappers that share the same mutable `inner` state. After deserialization
+/// both wrappers must still share that state so a single `update()` call
+/// propagates to both — the core invariant that keeps HashJoinExec ↔
+/// pushed-down ParquetSource dynamic filtering working across the wire.
 #[test]
-fn test_deduplication_within_plan_deserialization() -> Result<()> {
-    use datafusion_proto::bytes::{
-        physical_plan_from_bytes_with_proto_converter,
-        physical_plan_to_bytes_with_proto_converter,
-    };
+fn roundtrip_dynamic_filter_preserves_shared_inner() -> Result<()> {
+    use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
 
-    let field_a = Field::new("a", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a plan with expressions that will be deduplicated
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let projection_exprs = vec![
-        ProjectionExpr {
-            expr: Arc::clone(&col_expr),
-            alias: "a1".to_string(),
-        },
-        ProjectionExpr {
-            expr: Arc::clone(&col_expr), // Same Arc - will be deduplicated
-            alias: "a2".to_string(),
-        },
-    ];
-    let exec_plan = Arc::new(ProjectionExec::try_new(
-        projection_exprs,
-        Arc::new(EmptyExec::new(schema)),
-    )?);
-
-    let ctx = SessionContext::new();
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // Serialize
-    let bytes = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
-        &codec,
-        &proto_converter,
-    )?;
-
-    // First deserialization
-    let plan1 = physical_plan_from_bytes_with_proto_converter(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &proto_converter,
-    )?;
-
-    // Check that the plan was deserialized correctly with deduplication
-    let projection1 = plan1
-        .downcast_ref::<ProjectionExec>()
-        .expect("Expected ProjectionExec");
-    let exprs1: Vec<_> = projection1.expr().iter().collect();
-    assert_eq!(exprs1.len(), 2);
-    assert!(
-        Arc::ptr_eq(&exprs1[0].expr, &exprs1[1].expr),
-        "Expected both expressions to share the same Arc after deduplication"
-    );
-
-    // Second deserialization
-    let plan2 = physical_plan_from_bytes_with_proto_converter(
-        bytes.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &proto_converter,
-    )?;
-
-    // Check that the second plan was also deserialized correctly
-    let projection2 = plan2
-        .downcast_ref::<ProjectionExec>()
-        .expect("Expected ProjectionExec");
-    let exprs2: Vec<_> = projection2.expr().iter().collect();
-    assert_eq!(exprs2.len(), 2);
-    assert!(
-        Arc::ptr_eq(&exprs2[0].expr, &exprs2[1].expr),
-        "Expected both expressions to share the same Arc after deduplication"
-    );
-
-    // Check that there was no deduplication across deserializations
-    assert!(
-        !Arc::ptr_eq(&exprs1[0].expr, &exprs2[0].expr),
-        "Expected expressions from different deserializations to be different Arcs"
-    );
-    assert!(
-        !Arc::ptr_eq(&exprs1[1].expr, &exprs2[1].expr),
-        "Expected expressions from different deserializations to be different Arcs"
-    );
-
-    Ok(())
-}
-
-/// Test that deduplication works within direct expression deserialization and that
-/// separate deserializations produce independent expressions (no cross-operation sharing).
-#[test]
-fn test_deduplication_within_expr_deserialization() -> Result<()> {
-    let field_a = Field::new("a", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a binary expression where both sides are the same Arc
-    // This allows us to test deduplication within a single deserialization
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let binary_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-        Arc::clone(&col_expr),
-        Operator::Plus,
-        Arc::clone(&col_expr), // Same Arc - will be deduplicated
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let col_a = col("a", &schema)?;
+    let initial: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_a),
+        Operator::Gt,
+        lit(10i32),
+    ));
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&col_a)],
+        Arc::clone(&initial),
     ));
 
+    // Simulate a second call site (e.g. a pushed-down predicate) obtained via
+    // `with_new_children`. Both wrappers still share `inner`.
+    let df_other: Arc<dyn PhysicalExpr> =
+        Arc::clone(&df).with_new_children(vec![Arc::clone(&col_a)])?;
+    let df_as_expr: Arc<dyn PhysicalExpr> = Arc::clone(&df) as Arc<dyn PhysicalExpr>;
+    let predicate: Arc<dyn PhysicalExpr> =
+        Arc::new(BinaryExpr::new(df_as_expr, Operator::And, df_other));
+
+    let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let plan = Arc::new(FilterExec::try_new(predicate, input)?);
+
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
     let proto_converter = DeduplicatingProtoConverter {};
-
-    // Serialize the expression
-    let proto = proto_converter.physical_expr_to_proto(&binary_expr, &codec)?;
-
-    // First expression deserialization
-    let expr1 = proto_converter.proto_to_physical_expr(
-        &proto,
-        ctx.task_ctx().as_ref(),
-        &schema,
+    let bytes = physical_plan_to_bytes_with_proto_converter(
+        Arc::clone(&plan) as Arc<dyn ExecutionPlan>,
         &codec,
+        &proto_converter,
     )?;
-
-    // Check that deduplication worked within the deserialization
-    let binary1 = expr1
-        .downcast_ref::<BinaryExpr>()
-        .expect("Expected BinaryExpr");
-    assert!(
-        Arc::ptr_eq(binary1.left(), binary1.right()),
-        "Expected both sides to share the same Arc after deduplication"
-    );
-
-    // Second expression deserialization
-    let expr2 = proto_converter.proto_to_physical_expr(
-        &proto,
+    let result_plan = physical_plan_from_bytes_with_proto_converter(
+        bytes.as_ref(),
         ctx.task_ctx().as_ref(),
-        &schema,
-        &codec,
-    )?;
-
-    // Check that the second expression was also deserialized correctly
-    let binary2 = expr2
-        .downcast_ref::<BinaryExpr>()
-        .expect("Expected BinaryExpr");
-    assert!(
-        Arc::ptr_eq(binary2.left(), binary2.right()),
-        "Expected both sides to share the same Arc after deduplication"
-    );
-
-    // Check that there was no deduplication across deserializations
-    assert!(
-        !Arc::ptr_eq(binary1.left(), binary2.left()),
-        "Expected expressions from different deserializations to be different Arcs"
-    );
-    assert!(
-        !Arc::ptr_eq(binary1.right(), binary2.right()),
-        "Expected expressions from different deserializations to be different Arcs"
-    );
-
-    Ok(())
-}
-
-/// Test that session_id rotates between top-level serialization operations.
-/// This verifies that each top-level serialization gets a fresh session_id,
-/// which prevents cross-process collisions when serialized plans are merged.
-#[test]
-fn test_session_id_rotation_between_serializations() -> Result<()> {
-    let field_a = Field::new("a", DataType::Int64, false);
-    let _schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a simple expression
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // First serialization
-    let proto1 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id1 = proto1.expr_id.expect("Expected expr_id to be set");
-
-    // Second serialization with the same converter
-    // The session_id should have rotated, so the expr_id should be different
-    // even though we're serializing the same expression (same pointer address)
-    let proto2 = proto_converter.physical_expr_to_proto(&col_expr, &codec)?;
-    let expr_id2 = proto2.expr_id.expect("Expected expr_id to be set");
-
-    // The expr_ids should be different because session_id rotated
-    assert_ne!(
-        expr_id1, expr_id2,
-        "Expected different expr_ids due to session_id rotation between serializations"
-    );
-
-    // Also test that serializing the same expression multiple times within
-    // the same top-level operation would give the same expr_id (not testable
-    // here directly since each physical_expr_to_proto is a top-level operation,
-    // but the deduplication tests verify this indirectly)
-
-    Ok(())
-}
-
-/// Test that session_id rotation works correctly with execution plans.
-/// This verifies the end-to-end behavior with plan serialization.
-#[test]
-fn test_session_id_rotation_with_execution_plans() -> Result<()> {
-    use datafusion_proto::bytes::physical_plan_to_bytes_with_proto_converter;
-
-    let field_a = Field::new("a", DataType::Int64, false);
-    let schema = Arc::new(Schema::new(vec![field_a]));
-
-    // Create a simple plan
-    let col_expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-    let projection_exprs = vec![ProjectionExpr {
-        expr: Arc::clone(&col_expr),
-        alias: "a1".to_string(),
-    }];
-    let exec_plan = Arc::new(ProjectionExec::try_new(
-        projection_exprs.clone(),
-        Arc::new(EmptyExec::new(Arc::clone(&schema))),
-    )?);
-
-    let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DeduplicatingProtoConverter {};
-
-    // First serialization
-    let bytes1 = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
         &codec,
         &proto_converter,
     )?;
 
-    // Second serialization with the same converter
-    let bytes2 = physical_plan_to_bytes_with_proto_converter(
-        Arc::clone(&exec_plan) as Arc<dyn ExecutionPlan>,
+    let result_filter = result_plan
+        .downcast_ref::<FilterExec>()
+        .expect("Expected FilterExec");
+    let binary = result_filter
+        .predicate()
+        .downcast_ref::<BinaryExpr>()
+        .expect("Expected BinaryExpr predicate");
+    let left_df = binary
+        .left()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected left DynamicFilterPhysicalExpr");
+    let right_df = binary
+        .right()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected right DynamicFilterPhysicalExpr");
+
+    // Identity preserved
+    assert_eq!(df.expression_id(), left_df.expression_id());
+    assert_eq!(left_df.expression_id(), right_df.expression_id());
+
+    // Mutating one wrapper is visible through the other — the real test.
+    let updated: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_a),
+        Operator::Gt,
+        lit(42i32),
+    ));
+    left_df.update(Arc::clone(&updated))?;
+    // Both wrappers have identical children, so `current()` returns the raw
+    // inner expression unchanged — no remapping applied.
+    assert_eq!(&right_df.current()?, &updated);
+
+    Ok(())
+}
+
+/// Round-trip a plan where one call site has been through `with_new_children`
+/// with a *different* set of children than the canonical original. On
+/// deserialize the canonical wrapper must be shared but each site must also
+/// carry its own effective children.
+#[test]
+fn roundtrip_dynamic_filter_preserves_remapped_children() -> Result<()> {
+    use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]));
+    let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+    let initial: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_a),
+        Operator::Gt,
+        lit(10i32),
+    ));
+    let df = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&col_a)],
+        Arc::clone(&initial),
+    ));
+    // Second wrapper remaps `a` -> `b` to simulate a pushed-down site with a
+    // different projection.
+    let df_remapped: Arc<dyn PhysicalExpr> =
+        Arc::clone(&df).with_new_children(vec![Arc::clone(&col_b)])?;
+
+    let df_as_expr: Arc<dyn PhysicalExpr> = Arc::clone(&df) as Arc<dyn PhysicalExpr>;
+    let predicate: Arc<dyn PhysicalExpr> =
+        Arc::new(BinaryExpr::new(df_as_expr, Operator::And, df_remapped));
+
+    let input = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+    let plan = Arc::new(FilterExec::try_new(predicate, input)?);
+
+    let ctx = SessionContext::new();
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DeduplicatingProtoConverter {};
+    let bytes = physical_plan_to_bytes_with_proto_converter(
+        Arc::clone(&plan) as Arc<dyn ExecutionPlan>,
+        &codec,
+        &proto_converter,
+    )?;
+    let result_plan = physical_plan_from_bytes_with_proto_converter(
+        bytes.as_ref(),
+        ctx.task_ctx().as_ref(),
         &codec,
         &proto_converter,
     )?;
 
-    // The serialized bytes should be different due to different session_ids
-    // (specifically, the expr_id values embedded in the protobuf will differ)
-    assert_ne!(
-        bytes1.as_ref(),
-        bytes2.as_ref(),
-        "Expected different serialized bytes due to session_id rotation"
+    let binary = result_plan
+        .downcast_ref::<FilterExec>()
+        .expect("Expected FilterExec")
+        .predicate()
+        .downcast_ref::<BinaryExpr>()
+        .expect("Expected BinaryExpr predicate");
+    let left_df = binary
+        .left()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected left DynamicFilter");
+    let right_df = binary
+        .right()
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected right DynamicFilter");
+
+    // Shared identity.
+    assert_eq!(left_df.expression_id(), right_df.expression_id());
+
+    // Site-specific effective children differ: left keeps `a`, right maps to `b`.
+    let left_children: Vec<_> = left_df.children().into_iter().cloned().collect();
+    let right_children: Vec<_> = right_df.children().into_iter().cloned().collect();
+    assert_eq!(left_children, vec![Arc::clone(&col_a)]);
+    assert_eq!(right_children, vec![Arc::clone(&col_b)]);
+
+    // The load-bearing invariant: even though the two sites observe different
+    // columns, they share `inner`. An update through one wrapper must be
+    // visible through the other — and the remapping applied by `current()` on
+    // the remapped side must substitute col_a → col_b in the updated
+    // expression.
+    let gen_before = left_df.snapshot_generation();
+    assert_eq!(gen_before, right_df.snapshot_generation());
+
+    let updated_ref_a: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_a),
+        Operator::Lt,
+        lit(99i32),
+    ));
+    left_df.update(Arc::clone(&updated_ref_a))?;
+
+    assert_eq!(left_df.snapshot_generation(), gen_before + 1);
+    assert_eq!(right_df.snapshot_generation(), gen_before + 1);
+
+    // Left is the canonical (non-remapped) wrapper, so `current()` returns
+    // the stored inner expression unchanged.
+    assert_eq!(&left_df.current()?, &updated_ref_a);
+    // Right's `current()` remaps col_a → col_b.
+    let expected_right: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::clone(&col_b),
+        Operator::Lt,
+        lit(99i32),
+    ));
+    assert_eq!(&right_df.current()?, &expected_right);
+
+    Ok(())
+}
+
+/// Round-trip the shape from the PR description:
+///
+/// ```text
+/// FilterExec(dynamic_filter)
+///   ProjectionExec(a := Column("a", source_index))
+///     DataSourceExec
+///       ParquetSource(predicate = dynamic_filter)
+/// ```
+///
+/// After deserialization the `FilterExec`'s predicate and the `ParquetSource`'s
+/// pushed-down predicate must be two wrappers around the same shared `inner`,
+/// even though the `ParquetSource` site is reached through a `ProjectionExec`.
+#[test]
+fn roundtrip_dynamic_filter_in_parquet_pushdown() -> Result<()> {
+    use datafusion::physical_expr::expressions::DynamicFilterPhysicalExpr;
+
+    let data_source_schema =
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let projection_schema = Arc::clone(&data_source_schema);
+
+    // Canonical filter held by the (conceptual) producer side.
+    let producer_col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+    let df_producer = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&producer_col)],
+        lit(true),
+    ));
+
+    // Pushed-down wrapper — same inner state, potentially remapped children.
+    let df_pushed: Arc<dyn PhysicalExpr> = Arc::clone(&df_producer)
+        .with_new_children(vec![Arc::new(Column::new("a", 0))])?;
+
+    let parquet = Arc::new(
+        ParquetSource::new(Arc::clone(&data_source_schema))
+            .with_predicate(Arc::clone(&df_pushed)),
     );
+    let scan_config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), parquet)
+            .with_file_groups(vec![FileGroup::new(vec![PartitionedFile::new(
+                "/path/to/file.parquet".to_string(),
+                1024,
+            )])])
+            .build();
+    let data_source = DataSourceExec::from_data_source(scan_config);
 
-    // But both should deserialize correctly
+    let projection = Arc::new(ProjectionExec::try_new(
+        vec![ProjectionExpr {
+            expr: Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>,
+            alias: "a".to_string(),
+        }],
+        data_source,
+    )?) as Arc<dyn ExecutionPlan>;
+
+    let df_top: Arc<dyn PhysicalExpr> = Arc::clone(&df_producer) as Arc<dyn PhysicalExpr>;
+    let filter_exec =
+        Arc::new(FilterExec::try_new(df_top, projection)?) as Arc<dyn ExecutionPlan>;
+
     let ctx = SessionContext::new();
-    let deser_converter = DeduplicatingProtoConverter {};
-
-    let plan1 = datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter(
-        bytes1.as_ref(),
+    let codec = DefaultPhysicalExtensionCodec {};
+    let proto_converter = DeduplicatingProtoConverter {};
+    let bytes = physical_plan_to_bytes_with_proto_converter(
+        Arc::clone(&filter_exec),
+        &codec,
+        &proto_converter,
+    )?;
+    let result_plan = physical_plan_from_bytes_with_proto_converter(
+        bytes.as_ref(),
         ctx.task_ctx().as_ref(),
         &codec,
-        &deser_converter,
+        &proto_converter,
     )?;
 
-    let plan2 = datafusion_proto::bytes::physical_plan_from_bytes_with_proto_converter(
-        bytes2.as_ref(),
-        ctx.task_ctx().as_ref(),
-        &codec,
-        &deser_converter,
-    )?;
+    let top_filter = result_plan
+        .downcast_ref::<FilterExec>()
+        .expect("Expected top FilterExec");
+    let top_pred = Arc::clone(top_filter.predicate());
+    let top_df = top_pred
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected top predicate to be DynamicFilterPhysicalExpr");
 
-    // Verify both plans have the expected structure
-    assert_eq!(plan1.schema(), plan2.schema());
+    let projection = top_filter.children()[0]
+        .downcast_ref::<ProjectionExec>()
+        .expect("Expected ProjectionExec");
+    let data_source = projection
+        .input()
+        .downcast_ref::<DataSourceExec>()
+        .expect("Expected DataSourceExec");
+    let scan_config = data_source
+        .data_source()
+        .downcast_ref::<FileScanConfig>()
+        .expect("Expected FileScanConfig");
+    let pushed_pred = scan_config
+        .file_source()
+        .filter()
+        .expect("ParquetSource should have a pushed-down predicate after round-trip");
+    let pushed_df = pushed_pred
+        .downcast_ref::<DynamicFilterPhysicalExpr>()
+        .expect("Expected pushed predicate to be DynamicFilterPhysicalExpr");
+
+    // Both sites share identity.
+    assert_eq!(top_df.expression_id(), pushed_df.expression_id());
+
+    // An update on the top (producer) side must be visible at the scan site.
+    let before = top_df.snapshot_generation();
+    assert_eq!(before, pushed_df.snapshot_generation());
+
+    let new_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("a", 0)),
+        Operator::Gt,
+        lit(7i64),
+    ));
+    top_df.update(Arc::clone(&new_filter))?;
+
+    assert_eq!(pushed_df.snapshot_generation(), before + 1);
+    assert_eq!(&pushed_df.current()?, &new_filter);
+
+    // Verify the projection schema is still sane — guards against the plan
+    // being reshaped into something unrepresentative.
+    assert_eq!(projection.schema().fields(), projection_schema.fields());
 
     Ok(())
 }

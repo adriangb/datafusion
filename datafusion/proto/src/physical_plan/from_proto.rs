@@ -38,6 +38,7 @@ use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
 use datafusion_expr::dml::InsertOp;
+use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::expressions::{
@@ -533,6 +534,43 @@ pub fn parse_physical_expr_with_converter(
                 })
                 .collect::<Result<_>>()?;
             codec.try_decode_expr(extension.expr.as_slice(), &inputs)? as _
+        }
+        ExprType::DynamicFilter(node) => {
+            // Build a fresh wrapper from this site's view. When deserialized
+            // with `DeduplicatingDeserializer`, the first site to reach here
+            // becomes the canonical Arc kept in the id cache; subsequent sites
+            // bypass this construction and instead overlay their `children` on
+            // the cached canonical via `with_new_children` — preserving the
+            // canonical's `inner` state.
+            //
+            // Identity comes from the enclosing `PhysicalExprNode.expr_id`
+            // (stamped by the deduplicating serializer). Without that — e.g.
+            // when the default converter is used — the filter gets a fresh
+            // random id, giving each deserialized wrapper an independent
+            // identity, which matches the pre-dedup behavior.
+            let children = parse_physical_exprs(
+                &node.children,
+                ctx,
+                input_schema,
+                codec,
+                proto_converter,
+            )?;
+            let current_expr = parse_required_physical_expr(
+                node.current_expr.as_deref(),
+                ctx,
+                "current_expr",
+                input_schema,
+                codec,
+                proto_converter,
+            )?;
+            let id = proto.expr_id.unwrap_or_else(rand::random);
+            Arc::new(DynamicFilterPhysicalExpr::with_id_and_state(
+                id,
+                children,
+                current_expr,
+                node.generation,
+                node.is_complete,
+            )) as Arc<dyn PhysicalExpr>
         }
     };
 

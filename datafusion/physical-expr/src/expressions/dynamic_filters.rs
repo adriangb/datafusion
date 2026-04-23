@@ -55,8 +55,16 @@ impl FilterState {
 /// For more background, please also see the [Dynamic Filters: Passing Information Between Operators During Execution for 25x Faster Queries blog]
 ///
 /// [Dynamic Filters: Passing Information Between Operators During Execution for 25x Faster Queries blog]: https://datafusion.apache.org/blog/2025/09/10/dynamic-filters
-#[derive(Debug)]
 pub struct DynamicFilterPhysicalExpr {
+    /// Stable identifier shared by all wrappers that observe the same `inner`.
+    /// Generated once at construction; copied verbatim through `with_new_children`
+    /// so that every `Arc<DynamicFilterPhysicalExpr>` pointing at the same mutable
+    /// state reports the same id.
+    ///
+    /// Kept on the outer struct (rather than inside `Inner`) so that
+    /// `expression_id()` is a pure field read and does not require acquiring the
+    /// `inner` RwLock — the id never changes after construction anyway.
+    id: u64,
     /// The original children of this PhysicalExpr, if any.
     /// This is necessary because the dynamic filter may be initialized with a placeholder (e.g. `lit(true)`)
     /// and later remapped to the actual expressions that are being filtered.
@@ -89,16 +97,6 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(expr: Arc<dyn PhysicalExpr>) -> Self {
-        Self {
-            // Start with generation 1 which gives us a different result for [`PhysicalExpr::generation`] than the default 0.
-            // This is not currently used anywhere but it seems useful to have this simple distinction.
-            generation: 1,
-            expr,
-            is_complete: false,
-        }
-    }
-
     /// Clone the inner expression.
     fn expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.expr
@@ -137,6 +135,23 @@ impl Display for DynamicFilterPhysicalExpr {
     }
 }
 
+impl std::fmt::Debug for DynamicFilterPhysicalExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `id` is a random per-instance value; including it in Debug output
+        // makes plan snapshots nondeterministic across runs and across
+        // proto round-trips (receiver reconstructs the filter with the same
+        // id but the Debug representation would still differ from any freshly
+        // constructed filter on another machine). Skip it here.
+        f.debug_struct("DynamicFilterPhysicalExpr")
+            .field("children", &self.children)
+            .field("remapped_children", &self.remapped_children)
+            .field("inner", &self.inner)
+            .field("data_type", &self.data_type)
+            .field("nullable", &self.nullable)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DynamicFilterPhysicalExpr {
     /// Create a new [`DynamicFilterPhysicalExpr`]
     /// from an initial expression and a list of children.
@@ -169,11 +184,39 @@ impl DynamicFilterPhysicalExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
         inner: Arc<dyn PhysicalExpr>,
     ) -> Self {
-        let (state_watch, _) = watch::channel(FilterState::InProgress { generation: 1 });
+        Self::with_id_and_state(rand::random(), children, inner, 1, false)
+    }
+
+    /// Construct a `DynamicFilterPhysicalExpr` with all identity + mutable-state
+    /// fields supplied by the caller. Used on the deserialize side of proto
+    /// round-trip to rehydrate a filter with the id, generation counter, and
+    /// completion flag captured at serialization time.
+    ///
+    /// The `state_watch` channel is always fresh: cross-process update
+    /// propagation is not provided by proto, so waiters registered on the
+    /// sender do not carry across.
+    pub fn with_id_and_state(
+        id: u64,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+        inner: Arc<dyn PhysicalExpr>,
+        generation: u64,
+        is_complete: bool,
+    ) -> Self {
+        let initial_state = if is_complete {
+            FilterState::Complete { generation }
+        } else {
+            FilterState::InProgress { generation }
+        };
+        let (state_watch, _) = watch::channel(initial_state);
         Self {
+            id,
             children,
-            remapped_children: None, // Initially no remapped children
-            inner: Arc::new(RwLock::new(Inner::new(inner))),
+            remapped_children: None,
+            inner: Arc::new(RwLock::new(Inner {
+                generation,
+                expr: inner,
+                is_complete,
+            })),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
@@ -212,6 +255,12 @@ impl DynamicFilterPhysicalExpr {
     /// Get the current generation of the expression.
     fn current_generation(&self) -> u64 {
         self.inner.read().generation
+    }
+
+    /// Whether [`Self::mark_complete`] has been called on this filter's shared
+    /// state.
+    pub fn is_complete(&self) -> bool {
+        self.inner.read().is_complete
     }
 
     /// Get the current expression.
@@ -362,6 +411,7 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         Ok(Arc::new(Self {
+            id: self.id,
             children: self.children.clone(),
             remapped_children: Some(children),
             inner: Arc::clone(&self.inner),
@@ -443,6 +493,10 @@ impl PhysicalExpr for DynamicFilterPhysicalExpr {
     fn snapshot_generation(&self) -> u64 {
         // Return the current generation of the expression.
         self.inner.read().generation
+    }
+
+    fn expression_id(&self) -> Option<u64> {
+        Some(self.id)
     }
 }
 
@@ -860,5 +914,26 @@ mod test {
             hash1, hash3,
             "Hash should be stable after update (identity-based)"
         );
+    }
+
+    /// `expression_id` identifies the shared `inner` state, so it must be
+    /// identical on any wrapper produced by `with_new_children` — even one
+    /// whose `children()` view has been remapped. This is what lets proto
+    /// serialization link the two sides after deserialization.
+    #[test]
+    fn test_expression_id_stable_across_with_new_children() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("a", &schema).unwrap()],
+            lit(true) as Arc<dyn PhysicalExpr>,
+        ));
+        let id = filter
+            .expression_id()
+            .expect("dynamic filter must have an id");
+
+        let remapped = Arc::clone(&filter)
+            .with_new_children(vec![col("a", &schema).unwrap()])
+            .expect("with_new_children should succeed");
+        assert_eq!(remapped.expression_id(), Some(id));
     }
 }

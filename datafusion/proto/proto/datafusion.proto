@@ -920,6 +920,8 @@ message PhysicalExprNode {
     UnknownColumn unknown_column = 20;
 
     PhysicalHashExprNode hash_expr = 21;
+
+    PhysicalDynamicFilterExprNode dynamic_filter = 22;
   }
 }
 
@@ -1045,6 +1047,36 @@ message PhysicalHashExprNode {
   repeated PhysicalExprNode on_columns = 1;
   uint64 seed0 = 2;
   string description = 6;
+}
+
+// A DynamicFilterPhysicalExpr: a filter whose inner expression is shared,
+// mutable state owned by a producer (e.g. a HashJoinExec build side).
+//
+// Multiple `PhysicalExprNode`s in a plan can reference the same dynamic filter;
+// they are linked on the deserialize side via `id`. The first site to be
+// deserialized becomes the canonical wrapper and is cached; each subsequent
+// site overlays its own `children` on the canonical via
+// `PhysicalExpr::with_new_children`, preserving the canonical's mutable state
+// while keeping per-site projections.
+message PhysicalDynamicFilterExprNode {
+  // The filter expression as visible at this call site (equivalent to calling
+  // `current()` on the `DynamicFilterPhysicalExpr`, with any per-site child
+  // remapping already applied).
+  //
+  // Identity (for linking multiple call sites to the same shared state) is
+  // carried on the enclosing `PhysicalExprNode.expr_id` — populated by the
+  // `DeduplicatingProtoConverter` from `PhysicalExpr::expression_id`.
+  PhysicalExprNode current_expr = 1;
+  // The children visible at this call site — what `PhysicalExpr::children`
+  // returns. These are the `current_expr`'s leaf column references.
+  repeated PhysicalExprNode children = 2;
+  // Generation counter captured at serialization time. The receiver installs
+  // it on the reconstructed `Inner` so subsequent local `update()` calls keep
+  // a monotonic sequence. Does not propagate live updates from the sender.
+  uint64 generation = 3;
+  // Whether the sender had already called `mark_complete()` when this
+  // expression was serialized.
+  bool is_complete = 4;
 }
 
 message FilterExecNode {
