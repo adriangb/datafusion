@@ -1352,6 +1352,11 @@ message SortExecNode {
   // Maximum number of highest/lowest rows to fetch; negative means no limit
   int64 fetch = 3;
   bool preserve_partitioning = 4;
+  // TopK dynamic filter built by the sort and observed by pushed-down scans.
+  // Only present when `fetch` is set. Carried here so receiver's SortExec
+  // shares mutable state with the scan sites via the DeduplicatingProtoConverter's
+  // expr_id cache.
+  optional PhysicalExprNode dynamic_filter = 5;
 }
 
 message SortPreservingMergeExecNode {

@@ -1680,9 +1680,27 @@ impl protobuf::PhysicalPlanNode {
             return internal_err!("SortExec requires an ordering");
         };
         let fetch = (sort.fetch >= 0).then_some(sort.fetch as _);
-        let new_sort = SortExec::new(ordering, input)
+        let input_schema = input.schema();
+        let mut new_sort = SortExec::new(ordering, input)
             .with_fetch(fetch)
             .with_preserve_partitioning(sort.preserve_partitioning);
+
+        if let Some(proto_filter) = &sort.dynamic_filter {
+            let filter_expr = proto_converter.proto_to_physical_expr(
+                proto_filter,
+                ctx,
+                &input_schema,
+                codec,
+            )?;
+            let df = Arc::downcast::<DynamicFilterPhysicalExpr>(filter_expr).map_err(
+                |_| {
+                    proto_error(
+                        "SortExec.dynamic_filter was not a DynamicFilterPhysicalExpr",
+                    )
+                },
+            )?;
+            new_sort = new_sort.with_dynamic_filter(df);
+        }
 
         Ok(Arc::new(new_sort))
     }
@@ -3125,6 +3143,13 @@ impl protobuf::PhysicalPlanNode {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let dynamic_filter = exec
+            .dynamic_filter()
+            .map(|df| {
+                let df_expr: Arc<dyn PhysicalExpr> = df as _;
+                proto_converter.physical_expr_to_proto(&df_expr, codec)
+            })
+            .transpose()?;
         Ok(protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::Sort(Box::new(
                 protobuf::SortExecNode {
@@ -3135,6 +3160,7 @@ impl protobuf::PhysicalPlanNode {
                         _ => -1,
                     },
                     preserve_partitioning: exec.preserve_partitioning(),
+                    dynamic_filter,
                 },
             ))),
         })

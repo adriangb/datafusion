@@ -1990,6 +1990,12 @@ pub struct SortExecNode {
     pub fetch: i64,
     #[prost(bool, tag = "4")]
     pub preserve_partitioning: bool,
+    /// TopK dynamic filter built by the sort and observed by pushed-down scans.
+    /// Only present when `fetch` is set. Carried here so receiver's SortExec
+    /// shares mutable state with the scan sites via the DeduplicatingProtoConverter's
+    /// expr_id cache.
+    #[prost(message, optional, tag = "5")]
+    pub dynamic_filter: ::core::option::Option<PhysicalExprNode>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SortPreservingMergeExecNode {
