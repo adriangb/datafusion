@@ -184,43 +184,70 @@ impl DynamicFilterPhysicalExpr {
         children: Vec<Arc<dyn PhysicalExpr>>,
         inner: Arc<dyn PhysicalExpr>,
     ) -> Self {
-        Self::with_id_and_state(rand::random(), children, inner, 1, false)
-    }
-
-    /// Construct a `DynamicFilterPhysicalExpr` with all identity + mutable-state
-    /// fields supplied by the caller. Used on the deserialize side of proto
-    /// round-trip to rehydrate a filter with the id, generation counter, and
-    /// completion flag captured at serialization time.
-    ///
-    /// The `state_watch` channel is always fresh: cross-process update
-    /// propagation is not provided by proto, so waiters registered on the
-    /// sender do not carry across.
-    pub fn with_id_and_state(
-        id: u64,
-        children: Vec<Arc<dyn PhysicalExpr>>,
-        inner: Arc<dyn PhysicalExpr>,
-        generation: u64,
-        is_complete: bool,
-    ) -> Self {
-        let initial_state = if is_complete {
-            FilterState::Complete { generation }
-        } else {
-            FilterState::InProgress { generation }
-        };
-        let (state_watch, _) = watch::channel(initial_state);
+        let (state_watch, _) = watch::channel(FilterState::InProgress { generation: 1 });
         Self {
-            id,
+            id: rand::random(),
             children,
             remapped_children: None,
             inner: Arc::new(RwLock::new(Inner {
-                generation,
+                generation: 1,
                 expr: inner,
-                is_complete,
+                is_complete: false,
             })),
             state_watch,
             data_type: Arc::new(RwLock::new(None)),
             nullable: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Override this filter's [`Self::expression_id`].
+    ///
+    /// Typically used on the deserialize side of a proto round-trip so a
+    /// reconstructed wrapper keeps the same identity as the sender's, letting
+    /// multiple call sites share mutable state via the id cache.
+    pub fn with_id(mut self, id: u64) -> Self {
+        self.id = id;
+        self
+    }
+
+    /// Override the initial generation counter. Intended for the deserialize
+    /// side of a proto round-trip, to rehydrate the sender's generation so
+    /// later local [`Self::update`] calls keep a monotonic sequence.
+    ///
+    /// Only safe to call on a freshly-constructed filter that hasn't been
+    /// shared yet — use [`Self::update`] for live mutation of a shared filter.
+    pub fn with_generation(self, generation: u64) -> Self {
+        let is_complete = {
+            let mut inner = self.inner.write();
+            inner.generation = generation;
+            inner.is_complete
+        };
+        let _ = self.state_watch.send(if is_complete {
+            FilterState::Complete { generation }
+        } else {
+            FilterState::InProgress { generation }
+        });
+        self
+    }
+
+    /// Override the completion flag. Intended for the deserialize side of a
+    /// proto round-trip, to rehydrate a sender that had already called
+    /// [`Self::mark_complete`] before serialization.
+    ///
+    /// Only safe to call on a freshly-constructed filter that hasn't been
+    /// shared yet — use [`Self::mark_complete`] for live mutation.
+    pub fn with_is_complete(self, is_complete: bool) -> Self {
+        let generation = {
+            let mut inner = self.inner.write();
+            inner.is_complete = is_complete;
+            inner.generation
+        };
+        let _ = self.state_watch.send(if is_complete {
+            FilterState::Complete { generation }
+        } else {
+            FilterState::InProgress { generation }
+        });
+        self
     }
 
     fn remap_children(

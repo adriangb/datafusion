@@ -564,13 +564,12 @@ pub fn parse_physical_expr_with_converter(
                 proto_converter,
             )?;
             let id = proto.expr_id.unwrap_or_else(rand::random);
-            Arc::new(DynamicFilterPhysicalExpr::with_id_and_state(
-                id,
-                children,
-                current_expr,
-                node.generation,
-                node.is_complete,
-            )) as Arc<dyn PhysicalExpr>
+            Arc::new(
+                DynamicFilterPhysicalExpr::new(children, current_expr)
+                    .with_id(id)
+                    .with_generation(node.generation)
+                    .with_is_complete(node.is_complete),
+            ) as Arc<dyn PhysicalExpr>
         }
     };
 
