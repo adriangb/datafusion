@@ -210,6 +210,10 @@ impl ParquetOptions {
             coerce_int96: _,     // not used for writer props
             skip_arrow_metadata: _,
             max_predicate_cache_size: _,
+            // Read-time adaptive filter knobs; not used for writer props.
+            filter_pushdown_min_bytes_per_sec: _,
+            filter_collecting_byte_ratio_threshold: _,
+            filter_confidence_z: _,
         } = self;
 
         let mut builder = WriterProperties::builder()
@@ -483,6 +487,10 @@ mod tests {
             skip_arrow_metadata: defaults.skip_arrow_metadata,
             coerce_int96: None,
             max_predicate_cache_size: defaults.max_predicate_cache_size,
+            filter_pushdown_min_bytes_per_sec: defaults.filter_pushdown_min_bytes_per_sec,
+            filter_collecting_byte_ratio_threshold: defaults
+                .filter_collecting_byte_ratio_threshold,
+            filter_confidence_z: defaults.filter_confidence_z,
             use_content_defined_chunking: defaults.use_content_defined_chunking.clone(),
         }
     }
@@ -600,6 +608,11 @@ mod tests {
                 binary_as_string: global_options_defaults.binary_as_string,
                 skip_arrow_metadata: global_options_defaults.skip_arrow_metadata,
                 coerce_int96: None,
+                filter_pushdown_min_bytes_per_sec: global_options_defaults
+                    .filter_pushdown_min_bytes_per_sec,
+                filter_collecting_byte_ratio_threshold: global_options_defaults
+                    .filter_collecting_byte_ratio_threshold,
+                filter_confidence_z: global_options_defaults.filter_confidence_z,
                 use_content_defined_chunking: props.content_defined_chunking().map(|c| {
                     CdcOptions {
                         min_chunk_size: c.min_chunk_size,
