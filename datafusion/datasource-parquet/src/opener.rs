@@ -1408,18 +1408,16 @@ impl RowGroupsPrunedParquetOpen {
 ///    then through the projector.
 /// 3. When the reader exhausts, ask the tracker to re-partition filters
 ///    based on accumulated stats. If the placement changed, build a new
-///    [`RowFilter`] and call [`ParquetPushDecoder::swap_strategy`] before
+///    `RowFilter` and call [`ParquetPushDecoder::swap_strategy`] before
 ///    requesting the next row group.
 ///
 /// Why one decoder per file (vs the chunk-per-row-group split in PR #9):
-/// - Reuses [`PushBuffers`] across row groups so already-fetched bytes
-///   that survive a strategy swap aren't re-requested.
-/// - Avoids per-chunk [`AsyncFileReader::create_reader`] minting and the
-///   per-chunk [`RowFilter`] rebuild (`RowFilter` is `!Clone`).
+/// - Reuses arrow-rs `PushBuffers` across row groups so already-fetched
+///   bytes that survive a strategy swap aren't re-requested.
+/// - Avoids per-chunk reader minting and per-chunk `RowFilter` rebuild
+///   (`RowFilter` is `!Clone`).
 /// - One [`EarlyStoppingStream`] wrap covers the whole file — no
 ///   chunk-0-only special case for the non-`Clone` `FilePruner`.
-///
-/// [`PushBuffers`]: parquet::util::push_buffers::PushBuffers
 struct AdaptiveParquetStream {
     decoder: ParquetPushDecoder,
     reader: Box<dyn AsyncFileReader>,
@@ -1574,7 +1572,7 @@ impl AdaptiveParquetStream {
     }
 
     /// Re-evaluate filter placement at a row-group boundary. If the
-    /// row-filter set has changed, build a new [`RowFilter`] and apply it
+    /// row-filter set has changed, build a new `RowFilter` and apply it
     /// via [`ParquetPushDecoder::swap_strategy`]. Updates
     /// `post_scan_filters` and `post_scan_other_bytes_per_row` to reflect
     /// the new partition.
@@ -1694,9 +1692,9 @@ impl AdaptiveParquetStream {
 
 /// Apply a list of post-scan filters to a batch in order, AND-ing their
 /// boolean masks. Each filter's evaluation reports stats to the shared
-/// [`SelectivityTracker`] in the same units as the row-filter path so
-/// promote/demote decisions can compare row-level and post-scan filter
-/// effectiveness on one axis.
+/// [`SelectivityTracker`](crate::selectivity::SelectivityTracker) in the
+/// same units as the row-filter path so promote/demote decisions can
+/// compare row-level and post-scan filter effectiveness on one axis.
 ///
 /// `other_bytes_per_row[i]` is the bytes-per-row of the projection columns
 /// *not* referenced by `filters[i]` — i.e. the late-materialization saving
