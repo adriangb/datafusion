@@ -346,7 +346,7 @@ mod state_machine_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -373,7 +373,7 @@ mod state_machine_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -399,7 +399,7 @@ mod state_machine_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -421,7 +421,7 @@ mod state_machine_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -441,7 +441,7 @@ mod state_machine_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -466,7 +466,7 @@ mod state_machine_tests {
         let filters = vec![(1, expr.clone())];
 
         // First partition: goes to PostScan (high byte ratio)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -481,7 +481,7 @@ mod state_machine_tests {
         }
 
         // Second partition: should be promoted to RowFilter
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -504,7 +504,7 @@ mod state_machine_tests {
         let filters = vec![(1, expr.clone())];
 
         // First partition: goes to RowFilter (low byte ratio)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -520,7 +520,7 @@ mod state_machine_tests {
         }
 
         // Second partition: should be demoted to PostScan
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -543,7 +543,7 @@ mod state_machine_tests {
         let filters = vec![(1, expr.clone())];
 
         // Start as RowFilter
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -555,7 +555,7 @@ mod state_machine_tests {
         tracker.update(1, 100, 100, 100_000, 0);
 
         // Demote
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -583,7 +583,7 @@ mod state_machine_tests {
         let filters = vec![(1, expr.clone())];
 
         // Start as PostScan
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -597,7 +597,7 @@ mod state_machine_tests {
         }
 
         // Promote
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -625,7 +625,7 @@ mod state_machine_tests {
         let filters = vec![(1, expr.clone())];
 
         // Start as PostScan
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -638,7 +638,7 @@ mod state_machine_tests {
         }
 
         // Next partition: should stay as PostScan (not dropped because not optional)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -667,7 +667,7 @@ mod state_machine_tests {
             .insert(1, FilterState::Dropped);
 
         // On next partition, dropped filters should not reappear
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -696,7 +696,7 @@ mod filter_ordering_tests {
         ];
 
         // Partition should process all filters
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -711,7 +711,7 @@ mod filter_ordering_tests {
         tracker.update(2, 1, 100, 1_000_000, 100);
         tracker.update(3, 40, 100, 1_000_000, 100);
 
-        let result2 = tracker.partition_filters(
+        let result2 = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -737,7 +737,7 @@ mod filter_ordering_tests {
         ];
 
         // First partition - no stats yet
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -748,7 +748,7 @@ mod filter_ordering_tests {
         assert!(result.row_filters.len() + result.post_scan.len() > 0);
 
         // Filters should be consistent on repeated calls
-        let result2 = tracker.partition_filters(
+        let result2 = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -773,7 +773,7 @@ mod filter_ordering_tests {
         ];
 
         // First partition
-        let result1 = tracker.partition_filters(
+        let result1 = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -786,7 +786,7 @@ mod filter_ordering_tests {
         tracker.update(3, 60, 100, 1_000_000, 100);
 
         // Second partition with partial stats
-        let result2 = tracker.partition_filters(
+        let result2 = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -806,13 +806,13 @@ mod filter_ordering_tests {
             (3, col_expr("a", 2)),
         ];
 
-        let result1 = tracker.partition_filters(
+        let result1 = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
             &metadata,
         );
-        let result2 = tracker.partition_filters(
+        let result2 = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -844,7 +844,7 @@ mod dynamic_filter_tests {
         let expr1 = col_expr("a", 0);
         let filters1 = vec![(1, expr1)];
 
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters1,
             &std::collections::HashSet::new(),
             1000,
@@ -950,7 +950,7 @@ mod dynamic_filter_tests {
         // First partition: goes to RowFilter
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1060,7 +1060,7 @@ mod integration_tests {
         let filters = vec![(1, expr.clone())];
 
         // Step 1: Initial placement (PostScan)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1075,7 +1075,7 @@ mod integration_tests {
         }
 
         // Step 3: Promotion should occur
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1085,7 +1085,7 @@ mod integration_tests {
         assert_eq!(result.post_scan.len(), 0);
 
         // Step 4: Continue to partition without additional updates
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -1108,7 +1108,7 @@ mod integration_tests {
         let filters = vec![(1, expr.clone())];
 
         // Step 1: Initial placement (RowFilter)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1124,7 +1124,7 @@ mod integration_tests {
         }
 
         // Step 3: Demotion should occur
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1134,7 +1134,7 @@ mod integration_tests {
         assert_eq!(result.post_scan.len(), 1);
 
         // Step 4: Continue to partition without additional updates
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -1156,7 +1156,7 @@ mod integration_tests {
         let filters = vec![(1, col_expr("a", 0)), (2, col_expr("a", 1))];
 
         // Initial partition: both go to PostScan (500/1000 = 0.5 > 0.4)
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1176,7 +1176,7 @@ mod integration_tests {
         }
 
         // Next partition: Filter 1 promoted, Filter 2 stays PostScan
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -1194,7 +1194,7 @@ mod integration_tests {
         let metadata = create_test_metadata(vec![(100, vec![1000])]);
         let filters = vec![];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -1213,7 +1213,7 @@ mod integration_tests {
         let expr = col_expr("a", 0);
         let filters = vec![(1, expr)];
 
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,
@@ -1237,7 +1237,7 @@ mod integration_tests {
         let filters = vec![(1, expr.clone())];
 
         // Start as RowFilter
-        tracker.partition_filters(
+        tracker.partition_filters_for_test(
             filters.clone(),
             &std::collections::HashSet::new(),
             1000,
@@ -1251,7 +1251,7 @@ mod integration_tests {
         }
 
         // Should demote due to CI upper bound being 0
-        let result = tracker.partition_filters(
+        let result = tracker.partition_filters_for_test(
             filters,
             &std::collections::HashSet::new(),
             1000,

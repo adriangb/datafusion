@@ -21,6 +21,7 @@
 //! [`build()`](TrackerConfig::build) to produce a ready-to-use tracker.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 
 use parking_lot::{Mutex, RwLock};
 
@@ -46,6 +47,24 @@ pub struct TrackerConfig {
     /// Set to <= 0.0 to disable confidence intervals and promote/demote based on point estimates alone (not recommended).
     /// Set to INFINITY to disable promotion entirely (overrides `min_bytes_per_sec`).
     pub confidence_z: f64,
+    /// Initial-placement prior threshold: if per-conjunct row-group
+    /// statistics pruning prunes ≥ this fraction of the file's row
+    /// groups, place the filter at row-level on first encounter. Set
+    /// to >1.0 to disable the prior. Default 0.5.
+    pub prior_promote_threshold: f64,
+    /// Initial-placement prior threshold: if per-conjunct row-group
+    /// statistics pruning prunes ≤ this fraction of the file's row
+    /// groups, place the filter at post-scan on first encounter. Set
+    /// to <0.0 to disable the prior. Default 0.05.
+    pub prior_demote_threshold: f64,
+    /// Per-fetch latency baseline in milliseconds — at this average
+    /// per-fetch RTT the tracker uses the unmodified `confidence_z`.
+    /// Above this, `confidence_z` is shrunk proportionally so the
+    /// tracker becomes more aggressive about state changes when
+    /// per-request cost is high. 0.0 disables. Default 5.0.
+    pub latency_z_baseline_ms: f64,
+    /// Maximum scale factor for the latency-aware z shrink. Default 8.0.
+    pub latency_z_max_scale: f64,
 }
 
 impl TrackerConfig {
@@ -54,6 +73,10 @@ impl TrackerConfig {
             min_bytes_per_sec: f64::INFINITY,
             byte_ratio_threshold: 0.20,
             confidence_z: 2.0,
+            prior_promote_threshold: 0.5,
+            prior_demote_threshold: 0.05,
+            latency_z_baseline_ms: 5.0,
+            latency_z_max_scale: 8.0,
         }
     }
 
@@ -72,12 +95,34 @@ impl TrackerConfig {
         self
     }
 
+    pub fn with_prior_promote_threshold(mut self, v: f64) -> Self {
+        self.prior_promote_threshold = v;
+        self
+    }
+
+    pub fn with_prior_demote_threshold(mut self, v: f64) -> Self {
+        self.prior_demote_threshold = v;
+        self
+    }
+
+    pub fn with_latency_z_baseline_ms(mut self, v: f64) -> Self {
+        self.latency_z_baseline_ms = v;
+        self
+    }
+
+    pub fn with_latency_z_max_scale(mut self, v: f64) -> Self {
+        self.latency_z_max_scale = v;
+        self
+    }
+
     pub fn build(self) -> SelectivityTracker {
         SelectivityTracker {
             config: self,
             filter_stats: RwLock::new(HashMap::new()),
             skip_flags: RwLock::new(HashMap::new()),
             inner: Mutex::new(SelectivityTrackerInner::new()),
+            total_fetch_ns: AtomicU64::new(0),
+            total_fetches: AtomicU64::new(0),
         }
     }
 }

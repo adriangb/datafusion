@@ -22,12 +22,14 @@
 //! design (two layers: a shared-read map of per-filter `Mutex`es plus an
 //! inner state-machine `Mutex`) and the filter state diagram.
 
+use arrow::datatypes::SchemaRef;
 use log::debug;
 use parking_lot::{Mutex, RwLock};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::SchemaDescriptor;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr_common::physical_expr::{
@@ -38,58 +40,6 @@ use super::config::TrackerConfig;
 use super::stats::SelectivityStats;
 use super::types::{FilterId, FilterState, PartitionResult, PartitionedFilters};
 
-/// Cross-file adaptive system that measures filter effectiveness and decides
-/// which filters are promoted to row-level predicates (pushed into the Parquet
-/// reader) vs. applied post-scan (demoted) or dropped entirely.
-///
-/// # Locking design
-///
-/// All locks are **private** to this struct — external callers cannot hold a
-/// guard across expensive work, and all lock-holding code paths are auditable
-/// in this file alone.
-///
-/// State is split across two independent locks to minimise contention between
-/// the hot per-batch `update()` path and the cold per-file-open
-/// `partition_filters()` path:
-///
-/// - **`filter_stats`** (`RwLock<HashMap<FilterId, Mutex<SelectivityStats>>>`)
-///   — `update()` acquires a *shared read* lock on the outer map, then a
-///   per-filter `Mutex` to increment counters.  Multiple threads updating
-///   *different* filters never contend at all; threads updating the *same*
-///   filter serialize only on the cheap per-filter `Mutex` (~100 ns).
-///   `partition_filters()` also takes a read lock here when it needs to
-///   inspect stats for promotion/demotion decisions, so it never blocks
-///   `update()` callers.  The write lock is taken only briefly in Phase 2
-///   of `partition_filters()` to insert entries for newly-seen filter IDs.
-///
-/// - **`inner`** (`Mutex<SelectivityTrackerInner>`) — holds the filter
-///   state-machine (`filter_states`) and dynamic-filter generation tracking.
-///   Only `partition_filters()` acquires this lock (once per file open), so
-///   concurrent `update()` calls are completely unaffected.
-///
-/// ## Lock ordering (deadlock-free)
-///
-/// Locks are always acquired in the order `inner` → `filter_stats` →
-/// per-filter `Mutex`.  Because `update()` never acquires `inner`, no
-/// cycle is possible.
-///
-/// ## Correctness of concurrent access
-///
-/// `update()` may write stats while `partition_filters()` reads them for
-/// promotion/demotion.  Both hold a shared `filter_stats` read lock; the
-/// per-filter `Mutex` ensures they do not interleave on the same filter's
-/// stats.  One proceeds first; the other sees a consistent (slightly newer
-/// or older) snapshot.  This is benign — the single-lock design that
-/// preceded this split already allowed stats to change between consecutive
-/// reads within `partition_filters()`.
-///
-/// On promote/demote, `partition_filters()` zeros a filter's stats via the
-/// per-filter `Mutex`.  An `update()` running concurrently may write one
-/// stale batch's worth of data to the freshly-zeroed stats; this is quickly
-/// diluted by hundreds of correct-context batches and is functionally
-/// identical to the old design where `update()` queued behind the write
-/// lock and ran immediately after.
-///
 /// # Filter state machine
 ///
 /// ```text
@@ -135,9 +85,14 @@ use super::types::{FilterId, FilterState, PartitionResult, PartitionedFilters};
 /// └─────────────────┘                   └─────────────────┘
 /// ```
 ///
-/// See [`TrackerConfig`] for configuration knobs.
+/// See `TrackerConfig` for configuration knobs.
 pub struct SelectivityTracker {
     pub(super) config: TrackerConfig,
+    /// Cumulative wall time spent inside `AsyncFileReader::get_byte_ranges`
+    /// across all openers using this tracker.
+    pub(super) total_fetch_ns: AtomicU64,
+    /// Number of byte-range fetches recorded.
+    pub(super) total_fetches: AtomicU64,
     /// Per-filter selectivity statistics, each individually `Mutex`-protected.
     ///
     /// The outer `RwLock` is almost always read-locked: both `update()` (hot,
@@ -193,6 +148,39 @@ impl SelectivityTracker {
         TrackerConfig::new().build()
     }
 
+    /// Record one batch of `get_byte_ranges` activity (latency-aware z input).
+    pub fn record_fetch(&self, ranges: usize, elapsed_ns: u64) {
+        if ranges == 0 || elapsed_ns == 0 {
+            return;
+        }
+        self.total_fetch_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        self.total_fetches
+            .fetch_add(ranges as u64, Ordering::Relaxed);
+    }
+
+    fn avg_fetch_ms(&self) -> f64 {
+        let fetches = self.total_fetches.load(Ordering::Relaxed);
+        if fetches == 0 {
+            return 0.0;
+        }
+        let ns = self.total_fetch_ns.load(Ordering::Relaxed) as f64;
+        ns / fetches as f64 / 1_000_000.0
+    }
+
+    fn effective_z(&self) -> f64 {
+        let z = self.config.confidence_z;
+        if self.config.latency_z_baseline_ms <= 0.0 {
+            return z;
+        }
+        let avg = self.avg_fetch_ms();
+        if avg <= self.config.latency_z_baseline_ms {
+            return z;
+        }
+        let factor = (avg / self.config.latency_z_baseline_ms)
+            .clamp(1.0, self.config.latency_z_max_scale);
+        z / factor
+    }
+
     /// Update stats for a filter after processing a batch.
     ///
     /// **Locking:** acquires `filter_stats.read()` (shared) then a per-filter
@@ -204,14 +192,15 @@ impl SelectivityTracker {
     /// this cannot happen because `partition_filters()` runs during file open
     /// before any batches are processed).
     ///
-    /// **Mid-stream drop:** after every batch we evaluate the CI upper
-    /// bound for optional filters; if it falls below `min_bytes_per_sec`
-    /// and the filter is wrapped in `OptionalFilterPhysicalExpr`, we set
-    /// the per-filter skip flag. Subsequent calls to
-    /// `DatafusionArrowPredicate::evaluate` (row-level) and
-    /// `apply_post_scan_filters_with_stats` (post-scan) observe the flag
-    /// and short-circuit their work for that filter. Mandatory filters
-    /// are never flagged because doing so would change the result set.
+    /// **Mid-stream drop:** after every `SKIP_FLAG_CHECK_INTERVAL`'th batch
+    /// we evaluate the CI upper bound; if it falls below
+    /// `min_bytes_per_sec` and the filter is wrapped in
+    /// `OptionalFilterPhysicalExpr`, we set the per-filter skip flag.
+    /// Subsequent calls to `DatafusionArrowPredicate::evaluate` (row-level)
+    /// and `apply_post_scan_filters_with_stats` (post-scan) observe the
+    /// flag and short-circuit their work for that filter. Mandatory
+    /// filters are never flagged because doing so would change the result
+    /// set.
     #[doc(hidden)]
     pub fn update(
         &self,
@@ -246,7 +235,8 @@ impl SelectivityTracker {
         if !self.config.min_bytes_per_sec.is_finite() {
             return;
         }
-        let Some(ub) = stats.confidence_upper_bound(self.config.confidence_z) else {
+        let z = self.effective_z();
+        let Some(ub) = stats.confidence_upper_bound(z) else {
             return;
         };
         if ub >= self.config.min_bytes_per_sec {
@@ -308,14 +298,19 @@ impl SelectivityTracker {
     ///    to insert per-filter `Mutex` entries so that future `update()` calls
     ///    can find them.
     #[doc(hidden)]
+    #[expect(clippy::too_many_arguments)]
     pub fn partition_filters(
         &self,
         filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
         projection_columns: &std::collections::HashSet<usize>,
         projection_scan_size: usize,
         metadata: &ParquetMetaData,
+        arrow_schema: &SchemaRef,
+        parquet_schema: &SchemaDescriptor,
+        page_pruning_rates: &HashMap<FilterId, f64>,
     ) -> PartitionedFilters {
         // Phase 1: inner.lock() + filter_stats.read() → all decision logic
+        let z_eff = self.effective_z();
         let mut guard = self.inner.lock();
         let stats_map = self.filter_stats.read();
         let result = guard.partition_filters(
@@ -323,7 +318,11 @@ impl SelectivityTracker {
             projection_columns,
             projection_scan_size,
             metadata,
+            arrow_schema,
+            parquet_schema,
             &self.config,
+            z_eff,
+            page_pruning_rates,
             &stats_map,
         );
         drop(stats_map);
@@ -353,6 +352,37 @@ impl SelectivityTracker {
         result.partitioned
     }
 
+    /// Test-only convenience that derives `arrow_schema` / `parquet_schema`
+    /// from the parquet metadata and forwards to the public
+    /// [`Self::partition_filters`]. Lets test code keep its existing call
+    /// sites without threading two more arguments through every test.
+    #[doc(hidden)]
+    pub fn partition_filters_for_test(
+        &self,
+        filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
+        projection_columns: &std::collections::HashSet<usize>,
+        projection_scan_size: usize,
+        metadata: &ParquetMetaData,
+    ) -> PartitionedFilters {
+        let parquet_schema = metadata.file_metadata().schema_descr_ptr();
+        let arrow_schema: SchemaRef = match parquet::arrow::parquet_to_arrow_schema(
+            parquet_schema.as_ref(),
+            None,
+        ) {
+            Ok(s) => Arc::new(s),
+            Err(_) => Arc::new(arrow::datatypes::Schema::empty()),
+        };
+        self.partition_filters(
+            filters,
+            projection_columns,
+            projection_scan_size,
+            metadata,
+            &arrow_schema,
+            parquet_schema.as_ref(),
+            &HashMap::new(),
+        )
+    }
+
     /// Test helper: ensure a stats entry exists for the given filter ID.
     /// In production, `partition_filters()` inserts entries for new filters.
     /// Tests that call `update()` without prior `partition_filters()` need this.
@@ -368,10 +398,6 @@ impl SelectivityTracker {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// SelectivityTrackerInner: state machine + partition_filters logic.
-// ---------------------------------------------------------------------------
 
 /// Filter state-machine and generation tracking, guarded by the `Mutex`
 /// inside [`SelectivityTracker`].
@@ -485,13 +511,18 @@ impl SelectivityTrackerInner {
     }
 
     /// Partition filters into collecting / promoted / post-scan buckets.
-    pub(super) fn partition_filters(
+    #[expect(clippy::too_many_arguments)]
+    fn partition_filters(
         &mut self,
         filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)>,
         projection_columns: &std::collections::HashSet<usize>,
         projection_scan_size: usize,
         metadata: &ParquetMetaData,
+        arrow_schema: &SchemaRef,
+        parquet_schema: &SchemaDescriptor,
         config: &TrackerConfig,
+        z_eff: f64,
+        page_pruning_rates: &HashMap<FilterId, f64>,
         stats_map: &HashMap<FilterId, Mutex<SelectivityStats>>,
     ) -> PartitionResult {
         let mut new_optional_flags: Vec<(FilterId, bool)> = Vec::new();
@@ -549,7 +580,8 @@ impl SelectivityTrackerInner {
         let mut row_filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)> = Vec::new();
         let mut post_scan_filters: Vec<(FilterId, Arc<dyn PhysicalExpr>)> = Vec::new();
 
-        let confidence_z = config.confidence_z;
+        // Use the latency-aware effective z (clamped to <= config.confidence_z).
+        let confidence_z = z_eff;
         for (id, expr) in filters {
             let state = self.filter_states.get(&id).copied();
 
@@ -609,19 +641,66 @@ impl SelectivityTrackerInner {
                     new_optional_flags.push((id, is_optional_filter(&expr)));
                 }
 
-                let row_level =
-                    extra_bytes > 0 && byte_ratio <= config.byte_ratio_threshold;
+                // Selectivity prior from page-index pruning that the
+                // opener already ran on this file (see
+                // `PagePruningAccessPlanFilter::prune_plan_with_per_conjunct_stats`).
+                // No extra pruning work is done here — we just look up
+                // this filter's per-conjunct rate. When no rate is
+                // available (page index disabled, predicate not
+                // single-column, or schema mismatch), we fall back to
+                // the existing byte-ratio heuristic.
+                //
+                // **Dynamic-filter refresh**: when this conjunct is a
+                // populated DynamicFilter (snapshot_generation > 0)
+                // we evaluate a per-conjunct `PruningPredicate` against
+                // the file's row-group stats *now*, because the
+                // side-effect rates captured at file open were taken
+                // when the filter was still a placeholder. This is
+                // targeted re-evaluation — only for dynamic conjuncts
+                // that have updated since file open — so it doesn't
+                // count as an "extra pruning run" on the static path.
+                let dynamic_rate = if snapshot_generation(&expr) > 0 {
+                    fresh_rate_for_dynamic_conjunct(
+                        &expr,
+                        arrow_schema,
+                        parquet_schema,
+                        metadata,
+                    )
+                } else {
+                    None
+                };
+                let prior = dynamic_rate.or_else(|| page_pruning_rates.get(&id).copied());
+
+                let row_level = match prior {
+                    Some(p) if p >= config.prior_promote_threshold => {
+                        debug!(
+                            "FilterId {id}: New filter → Row filter via page-prior (pruned_rate={p:.3} >= {}) — {expr}",
+                            config.prior_promote_threshold
+                        );
+                        true
+                    }
+                    Some(p) if p <= config.prior_demote_threshold => {
+                        debug!(
+                            "FilterId {id}: New filter → Post-scan via page-prior (pruned_rate={p:.3} <= {}) — {expr}",
+                            config.prior_demote_threshold
+                        );
+                        false
+                    }
+                    _ => {
+                        let r =
+                            extra_bytes > 0 && byte_ratio <= config.byte_ratio_threshold;
+                        debug!(
+                            "FilterId {id}: New filter → {} via byte_ratio (byte_ratio={byte_ratio:.4}, extra_bytes={extra_bytes}, prior={prior:?}) — {expr}",
+                            if r { "Row filter" } else { "Post-scan" }
+                        );
+                        r
+                    }
+                };
+
                 if row_level {
-                    debug!(
-                        "FilterId {id}: New filter → Row filter (byte_ratio {byte_ratio:.4} <= {}, extra_bytes={extra_bytes}) — {expr}",
-                        config.byte_ratio_threshold
-                    );
                     self.filter_states.insert(id, FilterState::RowFilter);
                     row_filters.push((id, expr));
                 } else {
-                    debug!(
-                        "FilterId {id}: New filter → Post-scan (byte_ratio {byte_ratio:.4}, extra_bytes={extra_bytes}) — {expr}",
-                    );
                     self.filter_states.insert(id, FilterState::PostScan);
                     post_scan_filters.push((id, expr));
                 }
@@ -772,4 +851,102 @@ fn filter_scan_size(expr: &Arc<dyn PhysicalExpr>, metadata: &ParquetMetaData) ->
         .collect();
 
     crate::row_filter::total_compressed_bytes(&columns, metadata)
+}
+
+// (Per-conjunct page-pruning rates are now extracted as a side-effect
+// of the opener's existing page-index pruning pass — see
+// `PagePruningAccessPlanFilter::prune_plan_with_per_conjunct_stats`.
+// `partition_filters` reads them through its `page_pruning_rates`
+// parameter; no extra pruning runs happen on the static path.)
+
+/// Compute a fresh row-group pruning rate for a single dynamic
+/// conjunct, evaluated against the file's row-group statistics
+/// *now*. Used by `partition_filters` to refresh the prior for
+/// dynamic filters that were placeholders when the side-effect
+/// rates were captured at file open and have since been populated
+/// by the join build side.
+///
+/// Returns `None` when the conjunct doesn't translate into a
+/// usable pruning predicate (e.g. always-true after rewriting,
+/// references columns missing from the schema, contains
+/// hash_lookup-style nodes the rewriter can't handle).
+fn fresh_rate_for_dynamic_conjunct(
+    expr: &Arc<dyn PhysicalExpr>,
+    arrow_schema: &SchemaRef,
+    parquet_schema: &SchemaDescriptor,
+    metadata: &ParquetMetaData,
+) -> Option<f64> {
+    use datafusion_pruning::PruningPredicate;
+    // Unwrap OptionalFilterPhysicalExpr — pruning should evaluate
+    // the underlying predicate, not the marker.
+    let inner = if let Some(opt) = expr.downcast_ref::<OptionalFilterPhysicalExpr>() {
+        opt.inner()
+    } else {
+        Arc::clone(expr)
+    };
+    let groups = metadata.row_groups();
+    if groups.is_empty() {
+        return None;
+    }
+    let stats = crate::row_group_filter::RowGroupPruningStatistics {
+        parquet_schema,
+        row_group_metadatas: groups.iter().collect(),
+        arrow_schema: arrow_schema.as_ref(),
+    };
+
+    // First try: build a PruningPredicate from the whole conjunct.
+    if let Ok(pp) =
+        PruningPredicate::try_new(Arc::clone(&inner), Arc::clone(arrow_schema))
+        && !pp.always_true()
+        && let Ok(kept) = pp.prune(&stats)
+        && !kept.is_empty()
+    {
+        let total = kept.len();
+        let pruned = total - kept.iter().filter(|b| **b).count();
+        return Some(pruned as f64 / total as f64);
+    }
+
+    // Second try (the AND-with-hash-lookup case): snapshot the
+    // dynamic filter to materialize its current inner expression,
+    // then split the AND inside. `split_conjunction` doesn't descend
+    // into DynamicFilterPhysicalExpr wrappers, so without this step
+    // the split would return `[dynamic_filter]` and miss the
+    // prunable parts inside. We take the *max* pruning rate across
+    // sub-parts as a *promote* signal — if any sub-conjunct prunes
+    // a high fraction, the whole AND prunes at least that much. We
+    // deliberately do NOT use this as a demote signal.
+    let snapshot_result =
+        datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt(
+            Arc::clone(&inner),
+        )
+        .ok()?;
+    let snapshotted = snapshot_result.data;
+    let parts = datafusion_physical_expr::split_conjunction(&snapshotted);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut max_rate: Option<f64> = None;
+    for part in parts {
+        let Ok(pp) =
+            PruningPredicate::try_new(Arc::clone(part), Arc::clone(arrow_schema))
+        else {
+            continue;
+        };
+        if pp.always_true() {
+            continue;
+        }
+        let Ok(kept) = pp.prune(&stats) else { continue };
+        if kept.is_empty() {
+            continue;
+        }
+        let total = kept.len();
+        let pruned = total - kept.iter().filter(|b| **b).count();
+        let rate = pruned as f64 / total as f64;
+        max_rate = Some(max_rate.map_or(rate, |m| m.max(rate)));
+    }
+    // Promote-only semantics: only return when the partial-AND rate
+    // is high enough to be a confident promote signal. Below that we
+    // return None and let the standard prior / byte-ratio fallback
+    // run, which won't be misled by an undercounted rate.
+    max_rate.filter(|&r| r >= 0.5)
 }
