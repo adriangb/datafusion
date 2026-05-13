@@ -1362,33 +1362,35 @@ impl RowGroupsPrunedParquetOpen {
 
         let arrow_reader_metrics = ArrowReaderMetrics::enabled();
 
-        // Build the decoder's projection over the UNION of the user
-        // projection and **every** predicate conjunct's columns, regardless
-        // of whether each conjunct is currently row-level or post-scan.
+        // Build the decoder's projection over (user projection ∪
+        // initial post-scan filter columns). Row-level filter columns
+        // live in the RowFilter's per-predicate masks, so they don't
+        // need to be in the decoder's output stream batch.
         //
-        // Why all conjuncts (not just post-scan): a mid-stream
-        // `maybe_swap_strategy` call can demote a row-level filter to
-        // post-scan when its measured throughput drops below
-        // `min_bytes_per_sec`. The decoder's projection mask is fixed for
-        // the file (we don't grow it on swap), so any column that *might*
-        // be referenced by a post-scan filter at some point during the
-        // file must already be in the mask — otherwise the post-scan
-        // rebase fails with a schema-lookup error.
-        //
-        // Filter-only columns are stripped when the projector runs after
-        // post-scan filters, so the user-visible output schema is
-        // unchanged.
-        let read_plan = build_projection_read_plan(
-            prepared.projection.expr_iter().chain(
-                prepared
-                    .predicate_conjuncts
-                    .iter()
-                    .flatten()
-                    .map(|(_, expr)| Arc::clone(expr)),
-            ),
+        // The mask is NOT fixed for the file's life — `maybe_swap_strategy`
+        // can grow or shrink it at row-group boundaries when the optimal
+        // mask cols change (e.g. a filter promotes to row-level so its
+        // cols leave the mask, or a previously-placeholder dynamic filter
+        // wakes up and its cols enter the mask via a post-scan placement).
+        // Each mask change triggers a rebuild of `stream_schema`,
+        // `projector`, and the post-scan filter rebase; arrow-rs's
+        // `StrategySwap::with_projection` then installs the new mask
+        // before the next row group is read.
+        // Keep the *unrebased* projection (against physical_file_schema) so
+        // dynamic-mask changes can re-rebase it against a new stream_schema.
+        let original_projection = prepared.projection.clone();
+
+        // Build initial decoder projection state (stream_schema, projection
+        // mask, projector, rebased post-scan filters). Same helper is used
+        // for mid-stream mask swaps in `maybe_swap_strategy`.
+        let proj_state = build_decoder_projection_state(
+            &original_projection,
+            &post_scan_conjuncts,
+            &projection_columns,
             &prepared.physical_file_schema,
             reader_metadata.parquet_schema(),
-        );
+            &prepared.output_schema,
+        )?;
 
         let total_rows: i64 = file_metadata
             .row_groups()
@@ -1417,26 +1419,16 @@ impl RowGroupsPrunedParquetOpen {
             })
             .collect();
 
-        let stream_schema = Arc::clone(&read_plan.projected_schema);
-        let replace_schema = stream_schema != prepared.output_schema;
-
-        let rebased_projection = prepared
-            .projection
-            .clone()
-            .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
-        let post_scan_filters: Vec<(
-            crate::selectivity::FilterId,
-            Arc<dyn PhysicalExpr>,
-        )> = post_scan_conjuncts
-            .into_iter()
-            .map(|(id, expr)| {
-                reassign_expr_columns(expr, &stream_schema).map(|e| (id, e))
-            })
-            .collect::<Result<_>>()?;
+        let stream_schema = proj_state.stream_schema;
+        let replace_schema = proj_state.replace_schema;
+        let initial_mask_cols = proj_state.mask_cols;
+        let post_scan_filters = proj_state.rebased_post_scan;
+        let projector = proj_state.projector;
+        let initial_projection_mask = proj_state.projection_mask;
 
         let mut decoder_builder =
             ParquetPushDecoderBuilder::new_with_metadata(reader_metadata)
-                .with_projection(read_plan.projection_mask)
+                .with_projection(initial_projection_mask)
                 .with_batch_size(prepared.batch_size)
                 .with_metrics(arrow_reader_metrics.clone());
 
@@ -1474,7 +1466,6 @@ impl RowGroupsPrunedParquetOpen {
             prepared.file_metrics.predicate_cache_records.clone();
         let filter_apply_time = prepared.file_metrics.filter_apply_time.clone();
 
-        let projector = rebased_projection.make_projector(&stream_schema)?;
         let output_schema = Arc::clone(&prepared.output_schema);
         let files_ranges_pruned_statistics =
             prepared.file_metrics.files_ranges_pruned_statistics.clone();
@@ -1497,6 +1488,8 @@ impl RowGroupsPrunedParquetOpen {
                 post_scan_other_bytes_per_row,
                 filter_apply_time,
                 projector,
+                original_projection,
+                current_mask_cols: initial_mask_cols,
                 output_schema,
                 replace_schema,
                 arrow_reader_metrics,
@@ -1523,6 +1516,85 @@ impl RowGroupsPrunedParquetOpen {
             Ok(stream.boxed())
         }
     }
+}
+
+/// Bundles the per-mask decoder projection state. Produced at file open
+/// from the initial filter partition and again at any row-group boundary
+/// where `maybe_swap_strategy` decides the mask cols changed. Holding
+/// everything together keeps the two code paths in sync — the same
+/// expressions go through the same `build_projection_read_plan` ->
+/// `reassign_expr_columns` -> `make_projector` chain in both cases.
+struct DecoderProjectionState {
+    /// Schema of batches yielded by the decoder (post-mask, pre-projector).
+    stream_schema: SchemaRef,
+    /// Mask installed on the decoder / passed to `StrategySwap`.
+    projection_mask: parquet::arrow::ProjectionMask,
+    /// Projector that maps stream batches to the user-visible output.
+    projector: Projector,
+    /// Post-scan filter exprs rebased against `stream_schema`.
+    rebased_post_scan: Vec<(crate::selectivity::FilterId, Arc<dyn PhysicalExpr>)>,
+    /// True when `stream_schema != output_schema` and `project_batch`
+    /// must replace the schema metadata before yielding.
+    replace_schema: bool,
+    /// Leaf column indices the mask covers, kept for cheap change
+    /// detection on the next swap.
+    mask_cols: std::collections::BTreeSet<usize>,
+}
+
+/// Build a fresh [`DecoderProjectionState`] for the given partition of
+/// post-scan filters. Used at file open with the initial partition, and
+/// again on every mask-changing swap.
+///
+/// The "mask cols" are derived from `(user projection ∪ post_scan_conjuncts
+/// columns)`. Row-level filter columns are *not* in this set — arrow-rs's
+/// per-predicate masks decode them separately from the output stream
+/// batch.
+fn build_decoder_projection_state(
+    original_projection: &ProjectionExprs,
+    post_scan_conjuncts: &[(crate::selectivity::FilterId, Arc<dyn PhysicalExpr>)],
+    projection_columns: &std::collections::HashSet<usize>,
+    physical_file_schema: &SchemaRef,
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    output_schema: &SchemaRef,
+) -> Result<DecoderProjectionState> {
+    let read_plan = build_projection_read_plan(
+        original_projection
+            .expr_iter()
+            .chain(post_scan_conjuncts.iter().map(|(_, expr)| Arc::clone(expr))),
+        physical_file_schema,
+        parquet_schema,
+    );
+    let stream_schema = Arc::clone(&read_plan.projected_schema);
+    let replace_schema = stream_schema != *output_schema;
+
+    let rebased_projection = original_projection
+        .clone()
+        .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
+    let projector = rebased_projection.make_projector(&stream_schema)?;
+
+    let rebased_post_scan = post_scan_conjuncts
+        .iter()
+        .map(|(id, expr)| {
+            reassign_expr_columns(Arc::clone(expr), &stream_schema).map(|e| (*id, e))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut mask_cols: std::collections::BTreeSet<usize> =
+        projection_columns.iter().copied().collect();
+    for (_, expr) in post_scan_conjuncts {
+        for c in datafusion_physical_expr::utils::collect_columns(expr) {
+            mask_cols.insert(c.index());
+        }
+    }
+
+    Ok(DecoderProjectionState {
+        stream_schema,
+        projection_mask: read_plan.projection_mask,
+        projector,
+        rebased_post_scan,
+        replace_schema,
+        mask_cols,
+    })
 }
 
 /// State for a stream that decodes a single Parquet file with adaptive
@@ -1594,6 +1666,15 @@ struct AdaptiveParquetStream {
     post_scan_other_bytes_per_row: Vec<f64>,
     filter_apply_time: datafusion_physical_plan::metrics::Time,
     projector: Projector,
+    /// The user projection expressed against `physical_file_schema`,
+    /// kept here so the projector can be rebuilt against a new
+    /// `stream_schema` whenever the decoder mask changes.
+    original_projection: ProjectionExprs,
+    /// Leaf column indices currently covered by the decoder's projection
+    /// mask. Maintained in lockstep with the decoder; updated on every
+    /// successful `swap_strategy(with_projection(...))`. A change in this
+    /// set triggers the projector / stream_schema rebuild.
+    current_mask_cols: std::collections::BTreeSet<usize>,
     output_schema: Arc<Schema>,
     replace_schema: bool,
     arrow_reader_metrics: ArrowReaderMetrics,
@@ -1721,11 +1802,20 @@ impl AdaptiveParquetStream {
         }
     }
 
-    /// Re-evaluate filter placement at a row-group boundary. If the
-    /// row-filter set has changed, build a new `RowFilter` and apply it
-    /// via [`ParquetPushDecoder::swap_strategy`]. Updates
-    /// `post_scan_filters` and `post_scan_other_bytes_per_row` to reflect
-    /// the new partition.
+    /// Re-evaluate filter placement at a row-group boundary. The
+    /// resulting `StrategySwap` may install:
+    ///
+    /// - A new `RowFilter` (if the row-level filter set changed), and/or
+    /// - A new `ProjectionMask` (if the optimal mask cols changed —
+    ///   shrinks when a filter promotes out of post-scan, grows when a
+    ///   filter newly enters post-scan, e.g. a dynamic placeholder that
+    ///   woke up).
+    ///
+    /// When the mask changes we rebuild `stream_schema`, `projector`,
+    /// and re-rebase post-scan filter exprs against the new schema. The
+    /// invariant: `post_scan_filters` are always expressed in terms of
+    /// `stream_schema`, and `stream_schema` always matches the decoder's
+    /// current projection mask.
     ///
     /// No-op when the decoder isn't at a swap point or there are no
     /// conjuncts.
@@ -1742,14 +1832,30 @@ impl AdaptiveParquetStream {
             self.parquet_schema.as_ref(),
             &self.page_pruning_rates,
         );
+
         let new_ids: std::collections::BTreeSet<crate::selectivity::FilterId> =
             partitioned.row_filters.iter().map(|(id, _)| *id).collect();
+
+        // Cheap pre-check: if the row-filter set AND the mask cols would
+        // both be identical, skip the rest of the work. The mask check
+        // uses just the heuristic post-scan list (no unbuildable yet);
+        // unbuildable can only grow the col set, so if we see equality
+        // here we're guaranteed equality after merging — safe to bail.
         if new_ids == self.active_row_filter_ids {
-            // Placement unchanged for the row-filter set. Post-scan and
-            // dropped filters can change with stats but they don't need a
-            // decoder-level swap — `apply_post_scan_filters_with_stats`
-            // already consults `tracker.is_filter_skipped` per batch.
-            return Ok(());
+            let mut tentative_mask_cols: std::collections::BTreeSet<usize> =
+                self.projection_columns.iter().copied().collect();
+            for (_, expr) in &partitioned.post_scan {
+                for c in datafusion_physical_expr::utils::collect_columns(expr) {
+                    tentative_mask_cols.insert(c.index());
+                }
+            }
+            if tentative_mask_cols == self.current_mask_cols {
+                // Placement unchanged. Post-scan and dropped filters can
+                // change with stats but they don't need a decoder-level
+                // swap — `apply_post_scan_filters_with_stats` already
+                // consults `tracker.is_filter_skipped` per batch.
+                return Ok(());
+            }
         }
 
         // Rebuild the row filter from the new row-level set.
@@ -1762,11 +1868,25 @@ impl AdaptiveParquetStream {
             &self.file_metrics,
         )?;
 
-        // Combine post-scan + unbuildable into the new post-scan set,
-        // then rebase against the (stable) `stream_schema` and recompute
-        // bytes-per-row metrics.
+        // Combine post-scan + unbuildable into the new post-scan set.
+        // Unbuildable filters may reference cols outside the heuristic
+        // post-scan list, so the mask check has to wait until after we
+        // merge them.
         let mut post_scan = partitioned.post_scan;
         post_scan.extend(unbuildable);
+
+        // Rebuild the per-mask decoder state. The helper computes
+        // `mask_cols` from `(projection_columns ∪ post_scan cols)` so we
+        // pick up any unbuildable cols that just joined post-scan.
+        let new_state = build_decoder_projection_state(
+            &self.original_projection,
+            &post_scan,
+            &self.projection_columns,
+            &self.physical_file_schema,
+            self.parquet_schema.as_ref(),
+            &self.output_schema,
+        )?;
+        let mask_will_change = new_state.mask_cols != self.current_mask_cols;
 
         let total_rows: i64 = self
             .file_metadata
@@ -1797,25 +1917,29 @@ impl AdaptiveParquetStream {
             })
             .collect();
 
-        let post_scan_rebased: Vec<(
-            crate::selectivity::FilterId,
-            Arc<dyn PhysicalExpr>,
-        )> = post_scan
-            .into_iter()
-            .map(|(id, expr)| {
-                reassign_expr_columns(expr, &self.stream_schema).map(|e| (id, e))
-            })
-            .collect::<Result<_>>()?;
+        // Build the StrategySwap; only include `with_projection` when
+        // the mask actually changed (avoid unnecessary arrow-rs internal
+        // rebuilds when only the RowFilter set changed).
+        let mut swap = StrategySwap::new().with_filter(row_filter);
+        if mask_will_change {
+            swap = swap.with_projection(new_state.projection_mask.clone());
+        }
 
-        self.active_row_filter_ids = new_ids;
-        self.post_scan_filters = post_scan_rebased;
-        self.post_scan_other_bytes_per_row = post_scan_other_bytes_per_row;
-
-        // `with_filter(Some(rf))` installs the new filter; `with_filter(None)`
-        // clears it (when every conjunct moved out of row-level placement).
         self.decoder
-            .swap_strategy(StrategySwap::new().with_filter(row_filter))
-            .map_err(DataFusionError::from)
+            .swap_strategy(swap)
+            .map_err(DataFusionError::from)?;
+
+        // Decoder accepted the swap; commit state changes.
+        self.active_row_filter_ids = new_ids;
+        self.post_scan_filters = new_state.rebased_post_scan;
+        self.post_scan_other_bytes_per_row = post_scan_other_bytes_per_row;
+        if mask_will_change {
+            self.stream_schema = new_state.stream_schema;
+            self.projector = new_state.projector;
+            self.replace_schema = new_state.replace_schema;
+            self.current_mask_cols = new_state.mask_cols;
+        }
+        Ok(())
     }
 
     /// Copies metrics from ArrowReaderMetrics (the metrics collected by the
