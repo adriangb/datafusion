@@ -1280,6 +1280,7 @@ fn fresh_rate_for_dynamic_conjunct(
         parquet_schema,
         row_group_metadatas: groups.iter().collect(),
         arrow_schema: arrow_schema.as_ref(),
+        missing_null_counts_as_zero: false,
     };
 
     // First try: build a PruningPredicate from the whole conjunct.

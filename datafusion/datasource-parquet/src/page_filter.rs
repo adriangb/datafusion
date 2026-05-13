@@ -480,9 +480,12 @@ impl PagePruningAccessPlanFilter {
                     file_metrics,
                 );
 
-                let Some((selection, total_pages, matched_pages)) = selection else {
+                let Some((selection, page_match_flags)) = selection else {
                     continue;
                 };
+                let total_pages = page_match_flags.len();
+                let matched_pages =
+                    page_match_flags.iter().filter(|m| **m).count();
                 total_pages_select += matched_pages;
                 total_pages_skip += total_pages - matched_pages;
 
