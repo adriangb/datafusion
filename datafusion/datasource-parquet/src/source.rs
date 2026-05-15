@@ -477,6 +477,7 @@ impl ParquetSource {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_reverse_row_groups(mut self, reverse_row_groups: bool) -> Self {
         self.reverse_row_groups = reverse_row_groups;
         self
@@ -975,34 +976,34 @@ impl FileSource for ParquetSource {
             new
         };
 
-        // Check if the reversed ordering satisfies the requested ordering.
-        // If yes, this is the "Inexact via row-group reversal" case: source
-        // declares ASC ordering, request is DESC (or vice versa), so iterating
-        // RGs in reverse approximates the requested order.
-        if reversed_eq_properties.ordering_satisfy(order.iter().cloned())? {
-            let sort_order = LexOrdering::new(order.iter().cloned());
-            let mut new_source = self.clone().with_reverse_row_groups(true);
-            new_source.sort_order_for_reorder = sort_order;
-            return Ok(SortOrderPushdownResult::Inexact {
-                inner: Arc::new(new_source) as Arc<dyn FileSource>,
-            });
-        }
-
-        // Inexact via stats-based row-group reorder. Reached when the file
-        // has no declared ordering (so neither the natural nor the reversed
-        // ordering satisfies the request). Provided the sort key is a plain
-        // column present in the file schema, the source can still sort row
-        // groups by their min/max statistics at scan time — which is enough
-        // to make TopK converge quickly even on unsorted files.
+        // "Inexact" pushdown. Two independent reasons we can produce an
+        // approximate ordering; the source carries both flags so the opener
+        // can apply them in a fixed order (stats reorder, then reverse).
         //
-        // The reverse-only branch above is kept distinct: when the file
-        // already declares a matching reversed ordering, every row group is
-        // known to be sorted, so we can skip reading column statistics and
-        // flip the row group order directly.
-        if let Some(sort_order) = LexOrdering::new(order.iter().cloned()) {
-            let first = sort_order.first();
-            let is_descending = first.options.descending;
-            let column_in_file_schema = first
+        // 1. `reverse_row_groups` — set when the file declares a natural
+        //    ordering whose reverse satisfies the request. This is the only
+        //    path that can leverage equivalence-property reasoning, including
+        //    monotonic-function relationships (file declares
+        //    `extract_year_month(ws) ASC, ws ASC`, request is `ws DESC`).
+        //    The request's sort key need not be a plain column for this to
+        //    fire.
+        //
+        // 2. `sort_order_for_reorder` — set whenever the request's first
+        //    sort key is a plain column in the file schema. Lets the source
+        //    sort row groups by that column's per-RG min/max at scan time,
+        //    which is the only useful signal for files with no declared
+        //    ordering at all.
+        //
+        // The two flags compose: on a file whose RGs are already sorted by
+        // the request column, the stats reorder is a no-op and the reverse
+        // pass alone produces the desired RG iteration order. On a file with
+        // no declared ordering, the stats reorder does the work and the
+        // reverse pass flips it for DESC.
+        let reversed_satisfies =
+            reversed_eq_properties.ordering_satisfy(order.iter().cloned())?;
+        let sort_order = LexOrdering::new(order.iter().cloned());
+        let column_in_file_schema = sort_order.as_ref().is_some_and(|s| {
+            s.first()
                 .expr
                 .downcast_ref::<datafusion_physical_expr::expressions::Column>()
                 .is_some_and(|col| {
@@ -1010,23 +1011,22 @@ impl FileSource for ParquetSource {
                         .file_schema()
                         .field_with_name(col.name())
                         .is_ok()
-                });
-            if column_in_file_schema {
-                let mut new_source = self.clone();
-                new_source.sort_order_for_reorder = Some(sort_order);
-                // For DESC requests, also set `reverse_row_groups` so the
-                // opener's reverse pass flips RG iteration order after the
-                // stats-based reorder.
-                if is_descending {
-                    new_source.reverse_row_groups = true;
-                }
-                return Ok(SortOrderPushdownResult::Inexact {
-                    inner: Arc::new(new_source) as Arc<dyn FileSource>,
-                });
-            }
+                })
+        });
+
+        if !reversed_satisfies && !column_in_file_schema {
+            return Ok(SortOrderPushdownResult::Unsupported);
         }
 
-        Ok(SortOrderPushdownResult::Unsupported)
+        let is_descending = sort_order
+            .as_ref()
+            .is_some_and(|s| s.first().options.descending);
+        let mut new_source = self.clone();
+        new_source.sort_order_for_reorder = sort_order;
+        new_source.reverse_row_groups = reversed_satisfies || is_descending;
+        Ok(SortOrderPushdownResult::Inexact {
+            inner: Arc::new(new_source) as Arc<dyn FileSource>,
+        })
     }
 
     fn apply_expressions(
