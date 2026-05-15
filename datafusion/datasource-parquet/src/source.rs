@@ -523,7 +523,12 @@ impl ParquetSource {
 /// [`ParquetSource::reorder_files`]. When at least this fraction of
 /// adjacent file pairs (in sorted-by-min order) have overlapping
 /// `[min, max]` ranges, file reorder is skipped — file-level pruning
-/// cannot help and the reorder cost would dominate.
+/// by the dynamic filter cannot fire on overlapping ranges, so any
+/// cost spent reading per-file stats and sorting is wasted.
+///
+/// Same rationale and same open question as the RG-level
+/// `REORDER_OVERLAP_SKIP_THRESHOLD` in
+/// [`crate::access_plan`][crate::access_plan].
 const FILE_REORDER_OVERLAP_SKIP_THRESHOLD: f64 = 0.5;
 
 /// Returns `true` when adjacent file `[min, max]` ranges (in sorted-by-min
@@ -706,11 +711,9 @@ impl FileSource for ParquetSource {
         };
 
         // Skip when adjacent file [min, max] ranges overlap heavily —
-        // reordering cannot enable file-level pruning and the reorder cost
-        // (CPU sort + lost IO sequential locality + parallel scheduling
-        // pessimization across workers all pulling "best" files first)
-        // dominates. Same rationale as the RG-level guard in
-        // `PreparedAccessPlan::reorder_by_statistics`.
+        // file-level pruning by the dynamic filter cannot fire on
+        // overlapping ranges, so the per-file stats lookup + sort is
+        // pure overhead. See [`FILE_REORDER_OVERLAP_SKIP_THRESHOLD`].
         if files_have_heavy_overlap(&files, col_idx) {
             log::debug!(
                 "Skipping file reorder for {col_name}: file stats overlap >= 50%"

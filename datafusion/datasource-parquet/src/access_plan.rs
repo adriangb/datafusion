@@ -30,12 +30,23 @@ use parquet::file::metadata::{ParquetMetaData, RowGroupMetaData};
 /// `[min, max]` ranges overlap above which `reorder_by_statistics` will
 /// bail out without reordering.
 ///
-/// When stats overlap heavily (e.g. unsorted columns like ClickBench's
-/// `EventTime` on `hits_partitioned`), reordering by min cannot enable
-/// row-group-level pruning — every "later" RG still has values that
-/// could appear in TopK. The reorder cost (CPU sort + lost IO sequential
-/// locality + parallel scheduling pessimization across workers all
-/// pulling "best" RGs first) then dominates, producing a net regression.
+/// Heuristic guard against payloads where reorder cannot help: when
+/// adjacent ranges overlap heavily (e.g. the unsorted `EventTime`
+/// column on ClickBench's `hits_partitioned`, which is hash-partitioned
+/// by user-id), the reordered RG iteration order still has each "later"
+/// RG covering values that could appear in TopK, so row-group-level
+/// pruning by the runtime dynamic filter cannot fire. The CPU spent
+/// decoding per-RG min/max statistics + sorting indices is then pure
+/// overhead.
+///
+/// The original choice of `0.5` came from earlier benchmark runs on
+/// ClickBench `hits_partitioned` that showed 1.1–1.4x regressions on
+/// Q24/Q25/Q26 without the guard. A follow-up run on local NVMe
+/// (see `PERF_INVESTIGATION.md` on the review branch) failed to
+/// reproduce that — the same queries are 5–13 % *faster* with the
+/// guard disabled. The threshold is kept conservatively for now;
+/// removing it should be revisited once the original regression
+/// environment is identified.
 const REORDER_OVERLAP_SKIP_THRESHOLD: f64 = 0.5;
 
 /// A selection of rows and row groups within a ParquetFile to decode.
@@ -590,10 +601,12 @@ impl PreparedAccessPlan {
                 }
             };
 
-        // Bail out when adjacent ranges overlap heavily: reordering by min
-        // would not enable row-group-level pruning and the reorder cost
-        // (sort CPU + lost IO locality + parallel scheduling pessimization)
-        // dominates. See [`REORDER_OVERLAP_SKIP_THRESHOLD`].
+        // Bail out when adjacent ranges overlap heavily: reordering by
+        // min would not enable row-group-level pruning, so the work
+        // done above (decoding per-RG min/max + sorting indices) is
+        // pure overhead. See [`REORDER_OVERLAP_SKIP_THRESHOLD`] for
+        // why the threshold is `0.5` and the open question about
+        // whether the guard is still earning its keep.
         match adjacent_overlap_ratio(&stat_mins, &stat_maxes, &sorted_indices) {
             Some(ratio) if ratio >= REORDER_OVERLAP_SKIP_THRESHOLD => {
                 debug!(
