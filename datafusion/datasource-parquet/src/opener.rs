@@ -1172,45 +1172,20 @@ impl RowGroupsPrunedParquetOpen {
         // separate "scrape from `DynamicFilterPhysicalExpr`" fallback path,
         // because the dynamic filter is for runtime threshold pruning and
         // not the natural place for plan-time sort metadata.
-        let reorder_optimizer: Option<
-            Box<dyn crate::access_plan_optimizer::AccessPlanOptimizer>,
-        > = prepared.sort_order_for_reorder.as_ref().map(|sort_order| {
-            Box::new(crate::access_plan_optimizer::ReorderByStatistics::new(
-                sort_order.clone(),
-            )) as Box<dyn crate::access_plan_optimizer::AccessPlanOptimizer>
-        });
-
-        // Reverse for DESC queries. `reverse_row_groups` is set explicitly
-        // by `ParquetSource::try_pushdown_sort` whenever the requested
-        // ordering is DESC (either because the source's natural ordering
-        // is the reverse of the request, or because the request is DESC on
-        // a column present in the file schema).
-        let reverse_optimizer: Option<
-            Box<dyn crate::access_plan_optimizer::AccessPlanOptimizer>,
-        > = if prepared.reverse_row_groups {
-            Some(Box::new(crate::access_plan_optimizer::ReverseRowGroups))
-        } else {
-            None
-        };
-
-        // Prepare access plans (extract row groups and row selection), then
-        // apply the reorder + reverse optimizers above to each.
+        let reorder_sort_order = prepared.sort_order_for_reorder.as_ref();
+        let reverse_row_groups = prepared.reverse_row_groups;
         let prepare_access_plan =
             |plan: ParquetAccessPlan| -> Result<PreparedAccessPlan> {
                 let mut prepared_plan = plan.prepare(rg_metadata)?;
-                if let Some(opt) = &reorder_optimizer {
-                    prepared_plan = opt.optimize(
-                        prepared_plan,
+                if let Some(sort_order) = reorder_sort_order {
+                    prepared_plan = prepared_plan.reorder_by_statistics(
+                        sort_order,
                         file_metadata.as_ref(),
                         &prepared.physical_file_schema,
                     )?;
                 }
-                if let Some(opt) = &reverse_optimizer {
-                    prepared_plan = opt.optimize(
-                        prepared_plan,
-                        file_metadata.as_ref(),
-                        &prepared.physical_file_schema,
-                    )?;
+                if reverse_row_groups {
+                    prepared_plan = prepared_plan.reverse(file_metadata.as_ref())?;
                 }
                 Ok(prepared_plan)
             };
