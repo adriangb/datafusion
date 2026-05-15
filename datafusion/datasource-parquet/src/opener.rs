@@ -1154,24 +1154,23 @@ impl RowGroupsPrunedParquetOpen {
         // every per-morselizer-run access plan via the `prepare_access_plan`
         // closure below):
         //
-        // 1. reorder_by_statistics: sort RGs by min values (ASC) to align
-        //    with the file's declared output ordering. This fixes out-of-order
-        //    RGs (e.g., from append-heavy workloads) without changing direction.
-        //    Skipped gracefully when statistics are unavailable.
+        // 1. reorder_by_statistics: sort RGs by min values (ASC) of the
+        //    query's required sort column. For a file whose RGs are stored
+        //    out of order (e.g. append-heavy workloads, or a file with no
+        //    declared output ordering at all), this puts the RGs into the
+        //    order the query wants so TopK reads the most promising RGs
+        //    first. Skipped gracefully when statistics are unavailable.
         //
         // 2. reverse: flip the order for DESC queries. Applied AFTER reorder
         //    so the reversed order is correct whether or not reorder changed
         //    anything. Also handles row_selection remapping.
         //
-        // For sorted data: reorder is a no-op, reverse gives perfect DESC.
-        // For unsorted data: reorder fixes the order, reverse flips for DESC.
+        // For ASC-sorted data: reorder is a no-op, reverse alone gives DESC.
+        // For unsorted data: reorder produces ASC, reverse flips for DESC.
         //
-        // Both inputs come from the sort-pushdown channel:
-        // `ParquetSource::try_pushdown_sort` sets `sort_order_for_reorder`
-        // (and `reverse_row_groups` when the request is DESC) — there is no
-        // separate "scrape from `DynamicFilterPhysicalExpr`" fallback path,
-        // because the dynamic filter is for runtime threshold pruning and
-        // not the natural place for plan-time sort metadata.
+        // Both `sort_order_for_reorder` and `reverse_row_groups` are set by
+        // `ParquetSource::try_pushdown_sort`, the single entry point for
+        // sort information reaching the source.
         let reorder_sort_order = prepared.sort_order_for_reorder.as_ref();
         let reverse_row_groups = prepared.reverse_row_groups;
         let prepare_access_plan =

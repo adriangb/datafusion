@@ -2424,13 +2424,14 @@ TO 'test_files/scratch/sort_pushdown/tj_scrambled/data.parquet';
 statement ok
 SET datafusion.execution.parquet.max_row_group_size = 1048576;
 
-# No WITH ORDER — tests non-sort-pushdown TopK path
+# No WITH ORDER — tests the stats-based RG reorder path on an
+# externally-declared table without a sort property.
 statement ok
 CREATE EXTERNAL TABLE tj_scrambled(id INT, value INT)
 STORED AS PARQUET
 LOCATION 'test_files/scratch/sort_pushdown/tj_scrambled/data.parquet';
 
-# Test J.1: DESC LIMIT — RG reorder + reverse from DynamicFilter
+# Test J.1: DESC LIMIT — stats-based RG reorder + reverse
 query TT
 EXPLAIN SELECT * FROM tj_scrambled ORDER BY id DESC LIMIT 3;
 ----

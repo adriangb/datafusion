@@ -487,12 +487,12 @@ impl ParquetSource {
     }
 
     /// Extract the (column name, descending) tuple used by file-level
-    /// reordering. Driven entirely from the sort-pushdown channel
-    /// (`sort_order_for_reorder` + `reverse_row_groups`) — set by
-    /// `try_pushdown_sort`. We do not consult any dynamic-filter
-    /// metadata here: `DynamicFilterPhysicalExpr` is for runtime
-    /// threshold pruning, not for telling the source how to schedule
-    /// reads.
+    /// reordering. Both inputs come from `sort_order_for_reorder` and
+    /// `reverse_row_groups`, set by [`Self::try_pushdown_sort`].
+    ///
+    /// Returns `None` when the sort expression is not a plain column,
+    /// since the file-level reorder only knows how to consult per-column
+    /// min/max statistics.
     fn extract_topk_sort_info(&self) -> Option<(String, bool)> {
         let sort_order = self.sort_order_for_reorder.as_ref()?;
         let first = sort_order.first();
@@ -988,12 +988,17 @@ impl FileSource for ParquetSource {
             });
         }
 
-        // Inexact via stats-based row-group reorder. Even when neither natural
-        // nor reversed ordering matches (e.g. the table has no declared ordering),
-        // if the sort column is a plain column present in the file schema, the
-        // source can still reorder row groups by their min/max statistics at
-        // runtime. This helps any `ORDER BY` on a sorted source, not just TopK
-        // — the optimization is no longer tied to the dynamic filter path.
+        // Inexact via stats-based row-group reorder. Reached when the file
+        // has no declared ordering (so neither the natural nor the reversed
+        // ordering satisfies the request). Provided the sort key is a plain
+        // column present in the file schema, the source can still sort row
+        // groups by their min/max statistics at scan time — which is enough
+        // to make TopK converge quickly even on unsorted files.
+        //
+        // The reverse-only branch above is kept distinct: when the file
+        // already declares a matching reversed ordering, every row group is
+        // known to be sorted, so we can skip reading column statistics and
+        // flip the row group order directly.
         if let Some(sort_order) = LexOrdering::new(order.iter().cloned()) {
             let first = sort_order.first();
             let is_descending = first.options.descending;
