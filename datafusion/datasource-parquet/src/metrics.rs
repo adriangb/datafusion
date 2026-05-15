@@ -91,6 +91,8 @@ pub struct ParquetFileMetrics {
     /// number of rows that were stored in the cache after evaluating predicates
     /// reused for the output.
     pub predicate_cache_records: Gauge,
+    //// Time spent applying filters
+    pub filter_apply_time: Time,
 }
 
 impl ParquetFileMetrics {
@@ -192,6 +194,10 @@ impl ParquetFileMetrics {
             .with_category(MetricCategory::Rows)
             .gauge("predicate_cache_records", partition);
 
+        let filter_apply_time = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .subset_time("filter_apply_time", partition);
+
         Self {
             files_ranges_pruned_statistics,
             predicate_evaluation_errors,
@@ -211,6 +217,31 @@ impl ParquetFileMetrics {
             scan_efficiency_ratio,
             predicate_cache_inner_records,
             predicate_cache_records,
+            filter_apply_time,
         }
+    }
+
+    /// Record pages whose page-index pruning was skipped because the containing
+    /// row group was fully matched by row-group statistics.
+    ///
+    /// The counter is only registered when there is a non-zero value. This keeps
+    /// [`ParquetFileMetrics::new`] from cloning the filename and metrics set for
+    /// files that never use this metric.
+    pub(crate) fn add_page_index_pages_skipped_by_fully_matched(
+        metrics: &ExecutionPlanMetricsSet,
+        partition: usize,
+        filename: &str,
+        n: usize,
+    ) {
+        if n == 0 {
+            return;
+        }
+
+        let count = MetricBuilder::new(metrics)
+            .with_new_label("filename", filename.to_string())
+            .with_type(MetricType::Summary)
+            .with_category(MetricCategory::Rows)
+            .counter("page_index_pages_skipped_by_fully_matched", partition);
+        count.add(n);
     }
 }
