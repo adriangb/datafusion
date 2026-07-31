@@ -623,3 +623,7 @@ mod tests {
     test_round_trip_physical!(round_trip_physical_plan_q21, 21);
     test_round_trip_physical!(round_trip_physical_plan_q22, 22);
 }
+
+// No-op marker: this branch exists only to give the benchmark runner two
+// sides that compile to identical code, so the reported difference between
+// them is measurement noise and nothing else.
