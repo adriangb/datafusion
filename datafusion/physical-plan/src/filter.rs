@@ -37,7 +37,6 @@ use crate::filter_pushdown::{
     FilterPushdownPropagation, PushedDown,
 };
 use crate::limit::LocalLimitExec;
-use crate::memory_injection::MemoryInjection;
 use crate::metrics::{MetricBuilder, MetricType};
 use crate::projection::{
     EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
@@ -576,9 +575,6 @@ impl ExecutionPlan for FilterExec {
             context.task_id()
         );
         let metrics = FilterExecMetrics::new(&self.metrics, partition);
-        // DO NOT MERGE: injected before the input stream is created so the
-        // spike covers the whole of this stream's execution.
-        let memory_injection = MemoryInjection::install(context.memory_pool());
         Ok(Box::pin(FilterExecStream {
             schema: self.schema(),
             predicate: Arc::clone(&self.predicate),
@@ -590,7 +586,6 @@ impl ExecutionPlan for FilterExec {
                 self.batch_size,
                 self.fetch,
             ),
-            _memory_injection: memory_injection,
         }))
     }
 
@@ -1160,8 +1155,6 @@ struct FilterExecStream {
     projection: Option<ProjectionRef>,
     /// Batch coalescer to combine small batches
     batch_coalescer: LimitedBatchCoalescer,
-    /// DO NOT MERGE: deliberate memory spike, held for the stream's lifetime.
-    _memory_injection: Option<MemoryInjection>,
 }
 
 /// The metrics for `FilterExec`
