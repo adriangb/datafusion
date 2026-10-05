@@ -31,6 +31,7 @@ use crate::schema_adapter::SchemaAdapterFactory;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, not_impl_err};
+use datafusion_execution::TaskContext;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::DisplayFormatType;
@@ -90,6 +91,19 @@ pub trait FileSource: Any + Send + Sync {
     ) -> Result<Box<dyn Morselizer>> {
         let opener = self.create_file_opener(object_store, base_config, partition)?;
         Ok(Box::new(FileOpenerMorselizer::new(opener)))
+    }
+
+    /// Like [`Self::create_morselizer`], with the [`TaskContext`] of the scan,
+    /// for example to account memory in its memory pool. The default ignores
+    /// the context.
+    fn create_morselizer_with_context(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+        _context: &Arc<TaskContext>,
+    ) -> Result<Box<dyn Morselizer>> {
+        self.create_morselizer(object_store, base_config, partition)
     }
 
     /// Returns the table schema for the overall table (including partition columns, if any)
@@ -221,6 +235,26 @@ pub trait FileSource: Any + Send + Sync {
         Ok(FilterPushdownPropagation::with_parent_pushdown_result(
             vec![PushedDown::No; filters.len()],
         ))
+    }
+
+    /// Try to push down filters that stay above the scan, for pruning only.
+    ///
+    /// A `FilterExec` above the scan applies `filters`, thus the source does
+    /// not need to apply them to the rows. It can use them to prune, for
+    /// example files, row groups and pages. `filters` are in terms of the
+    /// unprojected table schema, as for [`Self::try_pushdown_filters`].
+    ///
+    /// `FileScanConfig` calls this method instead of
+    /// [`Self::try_pushdown_filters`] when a `FilterExec` above the scan runs
+    /// in more partitions than the scan. Returns the new source, or `None`
+    /// (the default) if the source does not support it: then
+    /// `FileScanConfig` calls [`Self::try_pushdown_filters`].
+    fn try_pushdown_pruning_filters(
+        &self,
+        _filters: &[Arc<dyn PhysicalExpr>],
+        _config: &ConfigOptions,
+    ) -> Result<Option<Arc<dyn FileSource>>> {
+        Ok(None)
     }
 
     /// Try to create a new FileSource that can produce data in the specified sort order.
