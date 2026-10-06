@@ -1128,6 +1128,13 @@ config_namespace! {
         /// turns it off.
         pub read_ahead_eager_bytes: usize, default = 0
 
+        /// Bytes that the files waiting behind the file being read may hold
+        /// in eager read-ahead, over all files of one scan partition. Each
+        /// file still takes at most `read_ahead_eager_bytes`. Files take
+        /// from this budget in the order they are opened, and a file gives
+        /// its bytes back when the scan reaches it. 0 means no shared bound.
+        pub read_ahead_prefetch_budget_bytes: usize, default = 0
+
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: ConfigNonZeroUsize, default = non_zero_usize_default(32)
 

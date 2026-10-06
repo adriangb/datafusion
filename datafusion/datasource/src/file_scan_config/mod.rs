@@ -62,10 +62,12 @@ use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType,
     display::{ProjectSchemaDisplay, display_orderings},
-    filter_pushdown::{FilterPushdownPropagation, PushedDown},
+    filter_pushdown::FilterPushdownPropagation,
     metrics::ExecutionPlanMetricsSet,
     repartition::round_robin_beneficial_for_rows,
 };
+#[cfg(test)]
+use datafusion_physical_plan::filter_pushdown::PushedDown;
 use log::{debug, warn};
 use std::any::Any;
 use std::{fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
