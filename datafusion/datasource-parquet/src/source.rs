@@ -28,6 +28,7 @@ use crate::opener::ParquetMorselizer;
 use crate::opener::build_pruning_predicates;
 use crate::opener::build_virtual_columns_state;
 use crate::optional_filter::{DecodeCost, OptionalFilterOptions, OptionalFilterSites};
+use crate::push_decoder::PrefetchBudget;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use arrow_schema::Fields;
 use arrow_schema::extension::ExtensionType;
@@ -726,6 +727,7 @@ impl ParquetSource {
                 .read_ahead_bytes
                 .map(|bytes| bytes as u64),
             read_ahead_eager_bytes: 0,
+            read_ahead_prefetch_budget: None,
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
@@ -786,11 +788,14 @@ impl FileSource for ParquetSource {
             .map(|_| Arc::clone(context.memory_pool()));
         let mut morselizer =
             self.build_morselizer(object_store, base_config, partition, memory_pool)?;
-        morselizer.read_ahead_eager_bytes = context
-            .session_config()
-            .options()
-            .execution
-            .read_ahead_eager_bytes as u64;
+        let execution = &context.session_config().options().execution;
+        morselizer.read_ahead_eager_bytes = execution.read_ahead_eager_bytes as u64;
+        morselizer.read_ahead_prefetch_budget =
+            (execution.read_ahead_prefetch_budget_bytes > 0).then(|| {
+                Arc::new(PrefetchBudget::new(
+                    execution.read_ahead_prefetch_budget_bytes as u64,
+                ))
+            });
         Ok(Box::new(morselizer))
     }
 

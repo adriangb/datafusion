@@ -35,8 +35,8 @@ use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
 use crate::optional_filter::OptionalFilterOptions;
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
-    DecoderBuilderConfig, InitialDecoderState, PushDecoderStreamState, ReadAhead,
-    ReadAheadMemory, RgPlanEntry, RowFilterContext, RowGroupPruner,
+    DecoderBuilderConfig, InitialDecoderState, PrefetchBudget, PushDecoderStreamState,
+    ReadAhead, ReadAheadMemory, RgPlanEntry, RowFilterContext, RowGroupPruner,
 };
 use crate::row_filter::{OptionalFilterRowFilterContext, PrebuiltRowFilterCandidate};
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
@@ -325,6 +325,11 @@ pub(super) struct ParquetMorselizer {
     /// Bytes each file stream fetches when it is built. Sourced from
     /// `datafusion.execution.read_ahead_eager_bytes`. 0 turns it off.
     pub read_ahead_eager_bytes: u64,
+    /// The budget that bounds eager read-ahead over all files of this
+    /// partition. Sourced from
+    /// `datafusion.execution.read_ahead_prefetch_budget_bytes`. `None` means
+    /// no shared bound.
+    pub read_ahead_prefetch_budget: Option<Arc<PrefetchBudget>>,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
     /// Optional sort order used to reorder row groups by their min/max statistics.
@@ -533,6 +538,7 @@ struct PreparedParquetOpen {
     row_group_range_assignment: RowGroupRangeAssignment,
     read_ahead_bytes: Option<u64>,
     read_ahead_eager_bytes: u64,
+    read_ahead_prefetch_budget: Option<Arc<PrefetchBudget>>,
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
@@ -1183,6 +1189,7 @@ impl ParquetMorselizer {
             row_group_range_assignment: self.row_group_range_assignment,
             read_ahead_bytes: self.read_ahead_bytes,
             read_ahead_eager_bytes: self.read_ahead_eager_bytes,
+            read_ahead_prefetch_budget: self.read_ahead_prefetch_budget.clone(),
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
@@ -1925,6 +1932,7 @@ impl RowGroupsPrunedParquetOpen {
 
         let read_ahead_bytes = prepared.read_ahead_bytes;
         let read_ahead_eager_bytes = prepared.read_ahead_eager_bytes;
+        let read_ahead_prefetch_budget = prepared.read_ahead_prefetch_budget.clone();
 
         // Lazily-registered suppression counter shared by the open-time first-RG
         // skip below and the stream's per-RG toggle (registered on first use so
@@ -2152,7 +2160,10 @@ impl RowGroupsPrunedParquetOpen {
             projection_builder,
             read_ahead,
         };
-        stream_state.start_eager_read_ahead(read_ahead_eager_bytes);
+        stream_state.start_eager_read_ahead(
+            read_ahead_eager_bytes,
+            read_ahead_prefetch_budget.as_ref(),
+        );
         let stream = stream_state.into_stream();
 
         // Wrap the stream so a dynamic filter can stop the file scan early, but
@@ -2470,6 +2481,7 @@ mod test {
         row_group_range_assignment: RowGroupRangeAssignment,
         read_ahead_bytes: Option<u64>,
         read_ahead_eager_bytes: u64,
+        read_ahead_prefetch_budget: Option<Arc<PrefetchBudget>>,
         memory_pool: Option<Arc<dyn MemoryPool>>,
         reverse_row_groups: bool,
         preserve_order: bool,
@@ -2695,6 +2707,7 @@ mod test {
                 row_group_range_assignment: RowGroupRangeAssignment::default(),
                 read_ahead_bytes: None,
                 read_ahead_eager_bytes: 0,
+                read_ahead_prefetch_budget: None,
                 memory_pool: None,
                 reverse_row_groups: false,
                 preserve_order: false,
@@ -2789,6 +2802,15 @@ mod test {
             factory: Arc<dyn ParquetFileReaderFactory>,
         ) -> Self {
             self.parquet_file_reader_factory = Some(factory);
+            self
+        }
+
+        /// Set the shared prefetch budget of eager read-ahead.
+        fn with_read_ahead_prefetch_budget(
+            mut self,
+            budget: Arc<PrefetchBudget>,
+        ) -> Self {
+            self.read_ahead_prefetch_budget = Some(budget);
             self
         }
 
@@ -2942,6 +2964,7 @@ mod test {
                 row_group_range_assignment: self.row_group_range_assignment,
                 read_ahead_bytes: self.read_ahead_bytes,
                 read_ahead_eager_bytes: self.read_ahead_eager_bytes,
+                read_ahead_prefetch_budget: self.read_ahead_prefetch_budget.clone(),
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
@@ -7227,6 +7250,56 @@ mod test {
             drop(morselizer);
             assert_eq!(pool.reserved(), 0, "the stream returns all it reserved");
             (before, rows)
+        }
+
+        /// Verifies that a shared prefetch budget bounds the eager fetches of
+        /// the files of one partition: a second file that does not fit waits,
+        /// and the first file returns its bytes when its stream is read.
+        #[tokio::test]
+        async fn prefetch_budget_bounds_eager_fetches_across_files() {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let (schema, len) = write_file(&store).await;
+            let fetches = Arc::new(Mutex::new(vec![]));
+            let factory = RecordingReaderFactory {
+                inner: DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
+                fetches: Arc::clone(&fetches),
+            };
+            let pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+            let budget_bytes = 400 * 1024;
+            let budget = Arc::new(PrefetchBudget::new(budget_bytes));
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(schema)
+                .with_projection_indices(&[0, 1])
+                .with_parquet_file_reader_factory(Arc::new(factory))
+                .with_read_ahead_bytes(WINDOW)
+                .with_read_ahead_eager_bytes(WINDOW / 2)
+                .with_read_ahead_prefetch_budget(Arc::clone(&budget))
+                .with_memory_pool(Arc::clone(&pool))
+                .build();
+            let file =
+                || PartitionedFile::new("read_ahead.parquet".to_string(), len as u64);
+
+            let first = open_file(&morselizer, file()).await.unwrap();
+            let second = open_file(&morselizer, file()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let before = fetches.lock().unwrap().clone();
+            assert_eq!(before.len(), 1, "only the first file fits: {before:?}");
+            assert_eq!(budget.remaining(), budget_bytes - before[0]);
+
+            let (_batches, rows) = count_batches_and_rows(first).await;
+            assert_eq!(rows, ROWS as usize);
+            assert_eq!(
+                budget.remaining(),
+                budget_bytes,
+                "the first file gave its bytes back"
+            );
+            let (_batches, rows) = count_batches_and_rows(second).await;
+            assert_eq!(rows, ROWS as usize);
+            drop(morselizer);
+            assert_eq!(budget.remaining(), budget_bytes);
+            assert_eq!(pool.reserved(), 0);
         }
 
         /// Verifies that eager read-ahead fetches data before the stream is

@@ -38,6 +38,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
@@ -1238,6 +1239,68 @@ struct InFlight {
     ranges: Vec<TaggedRange>,
     /// Total length of `ranges`.
     bytes: u64,
+    /// The prefetch budget that an eager fetch holds. Dropping the fetch,
+    /// when it lands or when the stream is dropped, returns the bytes.
+    _grant: Option<PrefetchGrant>,
+}
+
+/// A byte budget shared by the files of one scan partition for eager
+/// read-ahead (see [`PushDecoderStreamState::start_eager_read_ahead`]).
+///
+/// The files that wait behind the file being read take from it in the order
+/// they are opened. A file returns its bytes when its eager fetch lands in the
+/// decoder or when its stream is dropped. Thus the budget bounds the data that
+/// waiting files hold, whatever the number of files opened ahead.
+#[derive(Debug)]
+pub(crate) struct PrefetchBudget {
+    remaining: AtomicU64,
+}
+
+impl PrefetchBudget {
+    pub(crate) fn new(bytes: u64) -> Self {
+        Self {
+            remaining: AtomicU64::new(bytes),
+        }
+    }
+
+    /// Take at most `max` bytes. Returns the bytes taken, 0 if the budget is
+    /// empty.
+    fn take(&self, max: u64) -> u64 {
+        let mut remaining = self.remaining.load(Ordering::Acquire);
+        loop {
+            let taken = remaining.min(max);
+            match self.remaining.compare_exchange_weak(
+                remaining,
+                remaining - taken,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return taken,
+                Err(current) => remaining = current,
+            }
+        }
+    }
+
+    fn give_back(&self, bytes: u64) {
+        self.remaining.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining.load(Ordering::Acquire)
+    }
+}
+
+/// Bytes taken from a [`PrefetchBudget`], returned on drop.
+struct PrefetchGrant {
+    budget: Arc<PrefetchBudget>,
+    bytes: u64,
+}
+
+impl Drop for PrefetchGrant {
+    fn drop(&mut self) {
+        self.budget.give_back(self.bytes);
+    }
 }
 
 /// Accounts read-ahead in the [`MemoryPool`]: the bytes the decoder holds
@@ -1605,7 +1668,7 @@ impl PushDecoderStreamState {
         if ranges.is_empty() {
             return;
         }
-        self.spawn_read_ahead(ranges);
+        self.spawn_read_ahead(ranges, None);
     }
 
     /// Start the first read-ahead fetch now, before the stream is polled,
@@ -1617,28 +1680,50 @@ impl PushDecoderStreamState {
     ///
     /// Planned ranges are taken in order while they fit. Thus if the first
     /// planned range is bigger than `limit`, this fetches nothing.
-    pub(crate) fn start_eager_read_ahead(&mut self, limit: u64) {
+    pub(crate) fn start_eager_read_ahead(
+        &mut self,
+        limit: u64,
+        budget: Option<&Arc<PrefetchBudget>>,
+    ) {
         let Some(read_ahead) = self.read_ahead.as_mut() else {
             return;
         };
         if limit == 0 || read_ahead.in_flight.is_some() || self.reader.is_none() {
             return;
         }
-        let free = limit.min(read_ahead.window);
+        let mut free = limit.min(read_ahead.window);
+        if let Some(budget) = budget {
+            free = budget.take(free);
+            if free == 0 {
+                return;
+            }
+        }
         let current = read_ahead.current_row_group;
         let ranges = read_ahead.take_ranges(
             free,
             keep_row_group(current, &self.rg_plan, self.row_group_pruner.as_mut()),
         );
+        let bytes: u64 = ranges.iter().map(|(r, _)| r.end - r.start).sum();
+        let grant = budget.map(|budget| {
+            budget.give_back(free - bytes);
+            PrefetchGrant {
+                budget: Arc::clone(budget),
+                bytes,
+            }
+        });
         if ranges.is_empty() {
             return;
         }
         read_ahead.first_fetch = false;
-        self.spawn_read_ahead(ranges);
+        self.spawn_read_ahead(ranges, grant);
     }
 
     /// Spawn a background fetch of `ranges` with the idle reader.
-    fn spawn_read_ahead(&mut self, mut ranges: Vec<TaggedRange>) {
+    fn spawn_read_ahead(
+        &mut self,
+        mut ranges: Vec<TaggedRange>,
+        grant: Option<PrefetchGrant>,
+    ) {
         ranges.sort_by_key(|(range, _)| range.start);
         let fetch: Vec<Range<u64>> = ranges.iter().map(|(r, _)| r.clone()).collect();
         let bytes = fetch.iter().map(|r| r.end - r.start).sum();
@@ -1654,6 +1739,7 @@ impl PushDecoderStreamState {
             task,
             ranges,
             bytes,
+            _grant: grant,
         });
     }
 
