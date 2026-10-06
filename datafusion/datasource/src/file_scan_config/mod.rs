@@ -52,9 +52,7 @@ use datafusion_common::stats::{Precision, is_known_empty};
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::projection::{ProjectionExprs, ProjectionMapping};
 use datafusion_physical_expr::utils::reassign_expr_columns;
-use datafusion_physical_expr::{
-    DynamicFilterTracking, EquivalenceProperties, Partitioning, split_conjunction,
-};
+use datafusion_physical_expr::{EquivalenceProperties, Partitioning, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, is_volatile};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
@@ -1073,28 +1071,6 @@ impl DataSource for FileScanConfig {
             .map(|filter| reassign_expr_columns(filter, table_schema))
             .collect::<Result<Vec<_>>>()?;
 
-        // A filter that the scan applies runs in the partitions of the scan.
-        // If the optimizer would run a `FilterExec` above this scan in more
-        // partitions than the scan has, the filters stay above the scan
-        // (`PushedDown::No`), if the file source can use them for pruning
-        // only. This is only for the filters of a `FilterExec`: a dynamic
-        // filter (of a join, a TopK or an aggregate) has no `FilterExec`
-        // above the scan.
-        if !remapped_filters.iter().any(|filter| {
-            DynamicFilterTracking::classify(filter).contains_dynamic_filter()
-        }) && self.filters_run_in_more_partitions_above(config)?
-            && let Some(file_source) = self
-                .file_source
-                .try_pushdown_pruning_filters(&remapped_filters, config)?
-        {
-            let mut new_file_scan_config = self.clone();
-            new_file_scan_config.file_source = file_source;
-            return Ok(FilterPushdownPropagation {
-                filters: vec![PushedDown::No; remapped_filters.len()],
-                updated_node: Some(Arc::new(new_file_scan_config) as _),
-            });
-        }
-
         let result = self
             .file_source
             .try_pushdown_filters(remapped_filters, config)?;
@@ -1363,6 +1339,7 @@ impl FileScanConfig {
     /// The rows before the filter are the input of that round-robin
     /// repartition. An exact count is a limit: when it is at most one batch,
     /// a round-robin repartition cannot split the work.
+    #[allow(dead_code)]
     fn filters_run_in_more_partitions_above(
         &self,
         config: &ConfigOptions,
@@ -4383,6 +4360,7 @@ mod tests {
             (result.filters[0], source.pruning_only)
         }
 
+        #[ignore = "the bench branch removes the rule that keeps a filter above a narrow scan"]
         #[test]
         fn filter_stays_above_a_scan_that_cannot_split() {
             // One small file: the scan has one partition and cannot split
