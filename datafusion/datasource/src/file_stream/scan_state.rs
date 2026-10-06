@@ -29,18 +29,40 @@ use futures::{FutureExt as _, StreamExt as _};
 use super::work_source::WorkSource;
 use super::{FileStreamMetrics, OnError};
 
+/// Applies `on_error` to an error from opening a file.
+///
+/// Evaluates to `Some` with the value to return from `poll_scan`, or `None`
+/// to skip the file. It is a macro, not a method, because `poll_scan` holds a
+/// borrow of `metrics.time_processing` and this touches other metric fields.
+macro_rules! open_error {
+    ($this:ident, $err:expr) => {{
+        $this.metrics.file_open_errors.add(1);
+        $this.metrics.time_opening.stop();
+        match $this.on_error {
+            OnError::Skip => {
+                $this.metrics.files_processed.add(1);
+                None
+            }
+            OnError::Fail => Some(ScanAndReturn::Error($err)),
+        }
+    }};
+}
+
 /// State [`FileStreamState::Scan`].
 ///
 /// There is one `ScanState` per `FileStream`, and thus per output partition.
 ///
 /// It groups together the lifecycle of scanning that partition's files:
-/// unopened files, CPU-ready planners, pending planner I/O, ready morsels,
-/// the active reader, and the metrics associated with processing that work.
+/// unopened files, the files that are opening, the active reader, and the
+/// metrics associated with processing that work.
 ///
 /// # I/O
 ///
-/// To avoid challenges controlling buffering, the ScanState only ever has a
-/// single I/O outstanding at any time.
+/// The `ScanState` opens up to `open_ahead` files at the same time. Each
+/// opening file has at most one planner I/O outstanding, so at most
+/// `open_ahead` planner I/Os are outstanding. Only the file at the front of
+/// `open_files` turns its morsels into the active reader. Thus the stream
+/// decodes one file at a time, and it keeps the order of `work_source`.
 ///
 /// # State Transitions
 ///
@@ -48,16 +70,14 @@ use super::{FileStreamMetrics, OnError};
 /// work_source
 ///    |
 ///    v
-/// morselizer.plan_file(file)
+/// morselizer.plan_file(file)  (up to open_ahead files)
 ///    |
 ///    v
-/// ready_planners ---> plan() ---> ready_morsels ---> into_stream() ---> reader ---> RecordBatches
-///       ^               |
-///       |               v
-///       |          pending_planner
-///       |               |
-///       |               v
-///       +-------- poll until ready
+/// open_files[i]: ready_planners ---> plan() ---> morsels
+///                     ^               |            |
+///                     |               v            | front file only
+///                     +------- pending_planner     v
+///                                         into_stream() ---> reader ---> RecordBatches
 /// ```
 ///
 /// [`FileStreamState::Scan`]: super::FileStreamState::Scan
@@ -70,19 +90,85 @@ pub(super) struct ScanState {
     morselizer: Box<dyn Morselizer>,
     /// Behavior if opening or scanning a file fails.
     on_error: OnError,
-    /// CPU-ready planners for the current file.
-    ready_planners: VecDeque<Box<dyn MorselPlanner>>,
-    /// Ready morsels for the current file.
-    ready_morsels: VecDeque<Box<dyn Morsel>>,
-    /// The active reader, if any.
+    /// The maximum length of `open_files`.
+    open_ahead: usize,
+    /// Files that are open, in `work_source` order.
+    open_files: VecDeque<OpenFile>,
+    /// The active reader, if any. It reads a morsel of the front file.
     reader: Option<BoxStream<'static, Result<RecordBatch>>>,
-    /// The single planner currently blocked on I/O, if any.
-    ///
-    /// Once the I/O completes, yields the next planner and is pushed back
-    /// onto `ready_planners`.
-    pending_planner: Option<PendingMorselPlanner>,
     /// Metrics for the active scan queues.
     metrics: FileStreamMetrics,
+}
+
+/// The planning state of one open file.
+#[derive(Default)]
+struct OpenFile {
+    /// CPU-ready planners for this file.
+    ready_planners: VecDeque<Box<dyn MorselPlanner>>,
+    /// The single planner of this file that waits on I/O, if any.
+    pending_planner: Option<PendingMorselPlanner>,
+    /// Morsels of this file that wait to become the reader.
+    morsels: VecDeque<Box<dyn Morsel>>,
+}
+
+impl OpenFile {
+    /// Returns true when this file has no planning work and no morsels left.
+    fn is_exhausted(&self) -> bool {
+        self.ready_planners.is_empty()
+            && self.pending_planner.is_none()
+            && self.morsels.is_empty()
+    }
+
+    /// Polls planner I/O and, if `plan` is true, runs CPU planning for this
+    /// file until it waits on I/O or has no planners.
+    ///
+    /// If `plan` is true and this function returns `Ok`, either
+    /// `pending_planner` is set and was polled (so a waker is registered), or
+    /// `ready_planners` is empty.
+    fn drive(
+        &mut self,
+        cx: &mut Context<'_>,
+        metrics: &FileStreamMetrics,
+        plan: bool,
+    ) -> Result<()> {
+        loop {
+            if let Some(mut pending_planner) = self.pending_planner.take() {
+                match pending_planner.poll_unpin(cx) {
+                    Poll::Pending => {
+                        self.pending_planner = Some(pending_planner);
+                        return Ok(());
+                    }
+                    Poll::Ready(Ok(planner)) => self.ready_planners.push_back(planner),
+                    Poll::Ready(Err(err)) => return Err(err),
+                }
+            }
+
+            if !plan {
+                return Ok(());
+            }
+            let Some(planner) = self.ready_planners.pop_front() else {
+                return Ok(());
+            };
+            match planner.plan()? {
+                Some(mut plan) => {
+                    self.morsels.extend(plan.take_morsels());
+                    self.ready_planners.extend(plan.take_ready_planners());
+                    if let Some(pending_planner) = plan.take_pending_planner() {
+                        if self.pending_planner.is_some() {
+                            return Err(internal_datafusion_err!(
+                                "Conflicting pending planner state in FileStream ScanState"
+                            ));
+                        }
+                        self.pending_planner = Some(pending_planner);
+                    }
+                }
+                None => {
+                    // The planner pruned the rest of its file.
+                    metrics.files_processed.add(1);
+                }
+            }
+        }
+    }
 }
 
 impl ScanState {
@@ -92,16 +178,16 @@ impl ScanState {
         morselizer: Box<dyn Morselizer>,
         on_error: OnError,
         metrics: FileStreamMetrics,
+        open_ahead: usize,
     ) -> Self {
         Self {
             work_source,
             remain,
             morselizer,
             on_error,
-            ready_planners: Default::default(),
-            ready_morsels: Default::default(),
+            open_ahead: open_ahead.max(1),
+            open_files: Default::default(),
             reader: None,
-            pending_planner: None,
             metrics,
         }
     }
@@ -114,11 +200,10 @@ impl ScanState {
     /// Drives one iteration of the active scan state.
     ///
     /// Work is attempted in this order:
-    /// 1. resolve any pending planner I/O
-    /// 2. poll the active reader
-    /// 3. turn a ready morsel into the active reader
-    /// 4. run CPU planning on a ready planner
-    /// 5. morselize the next unopened file
+    /// 1. open unopened files until `open_files` holds `open_ahead` files
+    /// 2. run planning and planner I/O for every open file
+    /// 3. poll the active reader
+    /// 4. turn a morsel of the front file into the active reader
     ///
     /// The return [`ScanAndReturn`] tells `poll_inner` how to update the
     /// outer `FileStreamState`.
@@ -126,30 +211,43 @@ impl ScanState {
         let _processing_timer: ScopedTimerGuard<'_> =
             self.metrics.time_processing.timer();
 
-        // Try and resolve outstanding IO first. If it is still pending, check
-        // the current reader or ready morsels before yielding. New planning
-        // work must still wait for this I/O to resolve.
-        if let Some(mut pending_planner) = self.pending_planner.take() {
-            match pending_planner.poll_unpin(cx) {
-                // IO is still pending
-                Poll::Pending => {
-                    self.pending_planner = Some(pending_planner);
+        // Open more files. A morselizer only does CPU work here.
+        while self.open_files.len() < self.open_ahead {
+            let Some(part_file) = self.work_source.pop_front() else {
+                break;
+            };
+            if self.metrics.time_opening.start.is_none() {
+                self.metrics.time_opening.start();
+            }
+            match self.morselizer.plan_file(part_file) {
+                Ok(planner) => {
+                    self.metrics.files_opened.add(1);
+                    let mut open_file = OpenFile::default();
+                    open_file.ready_planners.push_back(planner);
+                    self.open_files.push_back(open_file);
                 }
-                // IO resolved, and the planner is ready for CPU work
-                Poll::Ready(Ok(planner)) => {
-                    self.ready_planners.push_back(planner);
+                Err(err) => {
+                    if let Some(ret) = open_error!(self, err) {
+                        return ret;
+                    }
                 }
-                // IO Error
-                Poll::Ready(Err(err)) => {
-                    self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    return match self.on_error {
-                        OnError::Skip => {
-                            self.metrics.files_processed.add(1);
-                            ScanAndReturn::Continue
-                        }
-                        OnError::Fail => ScanAndReturn::Error(err),
-                    };
+            }
+        }
+
+        // Drive every open file. Each file can have one planner I/O
+        // outstanding, so the open files load metadata in parallel. The files
+        // behind the front file also run CPU planning now, so that their next
+        // I/O starts while the front file streams. The front file only polls
+        // its I/O here and plans below, when no reader is active.
+        let mut i = 0;
+        while i < self.open_files.len() {
+            match self.open_files[i].drive(cx, &self.metrics, i > 0) {
+                Ok(()) => i += 1,
+                Err(err) => {
+                    self.open_files.remove(i);
+                    if let Some(ret) = open_error!(self, err) {
+                        return ret;
+                    }
                 }
             }
         }
@@ -172,7 +270,9 @@ impl ScanState {
                                 (batch, false)
                             } else {
                                 let batch = batch.slice(0, *remain);
-                                let done = 1 + self.work_source.skipped_on_limit();
+                                let done = 1
+                                    + self.work_source.skipped_on_limit()
+                                    + self.open_files.len().saturating_sub(1);
                                 self.metrics.files_processed.add(done);
                                 *remain = 0;
                                 (batch, true)
@@ -196,6 +296,8 @@ impl ScanState {
                     self.metrics.time_scanning_total.stop();
                     return match self.on_error {
                         OnError::Skip => {
+                            // Drop the rest of the failed file.
+                            self.open_files.pop_front();
                             self.metrics.files_processed.add(1);
                             ScanAndReturn::Continue
                         }
@@ -212,81 +314,34 @@ impl ScanState {
             }
         }
 
-        // No active reader, but a morsel is ready to become the reader.
-        if let Some(morsel) = self.ready_morsels.pop_front() {
+        // No active reader. Only the front file may supply the next reader,
+        // which keeps the output in file order.
+        let Some(front) = self.open_files.front_mut() else {
+            return ScanAndReturn::Done(None);
+        };
+        if let Some(morsel) = front.morsels.pop_front() {
             self.metrics.time_opening.stop();
             self.metrics.time_scanning_until_data.start();
             self.metrics.time_scanning_total.start();
             self.reader = Some(morsel.into_stream());
             return ScanAndReturn::Continue;
         }
-
-        // Do not start CPU planning or open another file while planner I/O is
-        // still outstanding because they may need additional IO and ScanState
-        // currently only permits a single outstanding IO
-        if self.pending_planner.is_some() {
-            return ScanAndReturn::Return(Poll::Pending);
+        if let Err(err) = front.drive(cx, &self.metrics, true) {
+            self.open_files.pop_front();
+            return open_error!(self, err).unwrap_or(ScanAndReturn::Continue);
+        }
+        if !front.morsels.is_empty() {
+            return ScanAndReturn::Continue;
+        }
+        if front.is_exhausted() {
+            // Each reader counted itself as processed when it ended, and
+            // `OpenFile::drive` counted each pruned planner.
+            self.open_files.pop_front();
+            return ScanAndReturn::Continue;
         }
 
-        // No reader or morsel, so try to produce more work via CPU planning.
-        if let Some(planner) = self.ready_planners.pop_front() {
-            return match planner.plan() {
-                Ok(Some(mut plan)) => {
-                    // Queue any newly-ready morsels, planners, or planner I/O.
-                    self.ready_morsels.extend(plan.take_morsels());
-                    self.ready_planners.extend(plan.take_ready_planners());
-                    if let Some(pending_planner) = plan.take_pending_planner() {
-                        // should not have planned if we have outstanding I/O
-                        if self.pending_planner.is_some() {
-                            return ScanAndReturn::Error(internal_datafusion_err!(
-                                "Conflicting pending planner state in FileStream ScanState"
-                            ));
-                        }
-                        self.pending_planner = Some(pending_planner);
-                    }
-                    ScanAndReturn::Continue
-                }
-                Ok(None) => {
-                    self.metrics.files_processed.add(1);
-                    self.metrics.time_opening.stop();
-                    ScanAndReturn::Continue
-                }
-                Err(err) => {
-                    self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    match self.on_error {
-                        OnError::Skip => {
-                            self.metrics.files_processed.add(1);
-                            ScanAndReturn::Continue
-                        }
-                        OnError::Fail => ScanAndReturn::Error(err),
-                    }
-                }
-            };
-        }
-
-        // No outstanding work remains, so begin planning the next unopened file.
-        let Some(part_file) = self.work_source.pop_front() else {
-            return ScanAndReturn::Done(None);
-        };
-
-        self.metrics.time_opening.start();
-        match self.morselizer.plan_file(part_file) {
-            Ok(planner) => {
-                self.metrics.files_opened.add(1);
-                self.ready_planners.push_back(planner);
-                ScanAndReturn::Continue
-            }
-            Err(err) => match self.on_error {
-                OnError::Skip => {
-                    self.metrics.file_open_errors.add(1);
-                    self.metrics.time_opening.stop();
-                    self.metrics.files_processed.add(1);
-                    ScanAndReturn::Continue
-                }
-                OnError::Fail => ScanAndReturn::Error(err),
-            },
-        }
+        // The front file waits on planner I/O, and `drive` registered a waker.
+        ScanAndReturn::Return(Poll::Pending)
     }
 }
 
