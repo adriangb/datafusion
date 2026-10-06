@@ -845,7 +845,7 @@ mod tests {
         // 1. the first `planner_called` produces `MorselId(10)` and creates `IoFutureId(1)`
         // 2. `MorselId(10)` continues yielding both batches while that I/O is pending
         // 3. after the I/O resolves, planning resumes and yields `MorselId(11)`
-        insta::assert_snapshot!(test.run().await.unwrap(), @r"
+        insta::assert_snapshot!(test.run().await.unwrap(), @"
         ----- Output Stream -----
         Batch: 41
         Batch: 42
@@ -858,18 +858,76 @@ mod tests {
         morsel_produced: file1.parquet, MorselId(10)
         io_future_created: file1.parquet, IoFutureId(1)
         io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
         morsel_stream_started: MorselId(10)
         io_future_polled: file1.parquet, IoFutureId(1)
         morsel_stream_batch_produced: MorselId(10), BatchId(41)
         io_future_polled: file1.parquet, IoFutureId(1)
-        morsel_stream_batch_produced: MorselId(10), BatchId(42)
-        io_future_polled: file1.parquet, IoFutureId(1)
         io_future_resolved: file1.parquet, IoFutureId(1)
+        morsel_stream_batch_produced: MorselId(10), BatchId(42)
         morsel_stream_finished: MorselId(10)
         planner_called: file1.parquet
         morsel_produced: file1.parquet, MorselId(11)
         morsel_stream_started: MorselId(11)
         morsel_stream_batch_produced: MorselId(11), BatchId(43)
+        morsel_stream_finished: MorselId(11)
+        ");
+
+        Ok(())
+    }
+
+    /// Verifies that with `open_ahead` above 1, the stream starts the
+    /// planner I/O of the next file before the first file yields a morsel,
+    /// and still outputs the files in order.
+    #[tokio::test]
+    async fn morsel_open_ahead_overlaps_planner_io() -> Result<()> {
+        let file = |name: &str, io: usize, morsel: usize, batch: i32| {
+            MockPlanner::builder(name)
+                .add_plan(MockPlanBuilder::new().with_pending_planner(
+                    IoFutureId(io),
+                    PollsToResolve(2),
+                    Ok(()),
+                ))
+                .add_plan(MockPlanBuilder::new().with_morsel(MorselId(morsel), batch))
+                .return_none()
+        };
+        let test = FileStreamMorselTest::new()
+            .with_preserve_order(true)
+            .with_open_ahead(2)
+            .with_file(file("file1.parquet", 1, 10, 41))
+            .with_file(file("file2.parquet", 2, 11, 42));
+
+        insta::assert_snapshot!(test.run().await.unwrap(), @"
+        ----- Output Stream -----
+        Batch: 41
+        Batch: 42
+        Done
+        ----- File Stream Events -----
+        morselize_file: file1.parquet
+        planner_created: file1.parquet
+        morselize_file: file2.parquet
+        planner_created: file2.parquet
+        planner_called: file2.parquet
+        io_future_created: file2.parquet, IoFutureId(2)
+        io_future_polled: file2.parquet, IoFutureId(2)
+        planner_called: file1.parquet
+        io_future_created: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_polled: file2.parquet, IoFutureId(2)
+        io_future_polled: file1.parquet, IoFutureId(1)
+        io_future_resolved: file1.parquet, IoFutureId(1)
+        planner_called: file1.parquet
+        morsel_produced: file1.parquet, MorselId(10)
+        io_future_polled: file2.parquet, IoFutureId(2)
+        io_future_resolved: file2.parquet, IoFutureId(2)
+        planner_called: file2.parquet
+        morsel_produced: file2.parquet, MorselId(11)
+        morsel_stream_started: MorselId(10)
+        morsel_stream_batch_produced: MorselId(10), BatchId(41)
+        morsel_stream_finished: MorselId(10)
+        morsel_stream_started: MorselId(11)
+        morsel_stream_batch_produced: MorselId(11), BatchId(42)
         morsel_stream_finished: MorselId(11)
         ");
 
@@ -1372,6 +1430,7 @@ mod tests {
         build_streams_on_first_read: bool,
         reads: Vec<PartitionId>,
         limit: Option<usize>,
+        open_ahead: usize,
     }
 
     impl FileStreamMorselTest {
@@ -1387,7 +1446,14 @@ mod tests {
                 build_streams_on_first_read: false,
                 reads: vec![],
                 limit: None,
+                open_ahead: 1,
             }
+        }
+
+        /// Sets how many files each stream opens at the same time.
+        fn with_open_ahead(mut self, open_ahead: usize) -> Self {
+            self.open_ahead = open_ahead;
+            self
         }
 
         /// Adds one file and its root planner to partition 0.
@@ -1527,6 +1593,7 @@ mod tests {
                         .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
+                        .with_open_ahead(self.open_ahead)
                         .build()?;
                     partitions[partition].set_stream(stream);
                 }
@@ -1554,6 +1621,7 @@ mod tests {
                         .with_shared_work_source(shared_work_source.clone())
                         .with_morselizer(Box::new(self.morselizer.clone()))
                         .with_metrics(&metrics_set)
+                        .with_open_ahead(self.open_ahead)
                         .build()?;
                     partition_state.set_stream(stream);
                 }
