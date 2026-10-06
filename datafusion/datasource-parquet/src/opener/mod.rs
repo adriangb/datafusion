@@ -322,6 +322,9 @@ pub(super) struct ParquetMorselizer {
     /// Read-ahead window in bytes. If set, decode a batch at a time. Sourced
     /// from `datafusion.execution.parquet.read_ahead_bytes`.
     pub read_ahead_bytes: Option<u64>,
+    /// Bytes each file stream fetches when it is built. Sourced from
+    /// `datafusion.execution.read_ahead_eager_bytes`. 0 turns it off.
+    pub read_ahead_eager_bytes: u64,
     /// Whether to read row groups in reverse order
     pub reverse_row_groups: bool,
     /// Optional sort order used to reorder row groups by their min/max statistics.
@@ -529,6 +532,7 @@ struct PreparedParquetOpen {
     max_in_list_size: usize,
     row_group_range_assignment: RowGroupRangeAssignment,
     read_ahead_bytes: Option<u64>,
+    read_ahead_eager_bytes: u64,
     reverse_row_groups: bool,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
@@ -1178,6 +1182,7 @@ impl ParquetMorselizer {
             max_in_list_size: self.max_in_list_size,
             row_group_range_assignment: self.row_group_range_assignment,
             read_ahead_bytes: self.read_ahead_bytes,
+            read_ahead_eager_bytes: self.read_ahead_eager_bytes,
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
@@ -1919,6 +1924,7 @@ impl RowGroupsPrunedParquetOpen {
             .sum();
 
         let read_ahead_bytes = prepared.read_ahead_bytes;
+        let read_ahead_eager_bytes = prepared.read_ahead_eager_bytes;
 
         // Lazily-registered suppression counter shared by the open-time first-RG
         // skip below and the stream's per-RG toggle (registered on first use so
@@ -2111,7 +2117,7 @@ impl RowGroupsPrunedParquetOpen {
                 ReadAheadMemory::new(prepared.memory_pool, prepared.partition_index);
             ReadAhead::new(window, decoder.scan_plan(), memory)
         });
-        let stream = PushDecoderStreamState {
+        let mut stream_state = PushDecoderStreamState {
             decoder: Some(decoder),
             active_reader: None,
             rg_plan,
@@ -2145,8 +2151,9 @@ impl RowGroupsPrunedParquetOpen {
             flush_at_row_group_boundary: watches_dynamic_filter,
             projection_builder,
             read_ahead,
-        }
-        .into_stream();
+        };
+        stream_state.start_eager_read_ahead(read_ahead_eager_bytes);
+        let stream = stream_state.into_stream();
 
         // Wrap the stream so a dynamic filter can stop the file scan early, but
         // only when the pruner is still watching a filter that can change
@@ -2462,6 +2469,7 @@ mod test {
         max_in_list_size: usize,
         row_group_range_assignment: RowGroupRangeAssignment,
         read_ahead_bytes: Option<u64>,
+        read_ahead_eager_bytes: u64,
         memory_pool: Option<Arc<dyn MemoryPool>>,
         reverse_row_groups: bool,
         preserve_order: bool,
@@ -2686,6 +2694,7 @@ mod test {
                 max_in_list_size: MAX_IN_LIST_SIZE,
                 row_group_range_assignment: RowGroupRangeAssignment::default(),
                 read_ahead_bytes: None,
+                read_ahead_eager_bytes: 0,
                 memory_pool: None,
                 reverse_row_groups: false,
                 preserve_order: false,
@@ -2780,6 +2789,12 @@ mod test {
             factory: Arc<dyn ParquetFileReaderFactory>,
         ) -> Self {
             self.parquet_file_reader_factory = Some(factory);
+            self
+        }
+
+        /// Set the eager read-ahead bytes (`read_ahead_eager_bytes`).
+        fn with_read_ahead_eager_bytes(mut self, bytes: u64) -> Self {
+            self.read_ahead_eager_bytes = bytes;
             self
         }
 
@@ -2926,6 +2941,7 @@ mod test {
                 max_in_list_size: self.max_in_list_size,
                 row_group_range_assignment: self.row_group_range_assignment,
                 read_ahead_bytes: self.read_ahead_bytes,
+                read_ahead_eager_bytes: self.read_ahead_eager_bytes,
                 reverse_row_groups: self.reverse_row_groups,
                 sort_order_for_reorder: None,
                 virtual_state,
@@ -7178,6 +7194,57 @@ mod test {
                 fetches,
                 reserved,
             }
+        }
+
+        /// Open the file with read-ahead and `eager` bytes of eager
+        /// read-ahead. Returns the data fetches made before the first poll of
+        /// the stream, and the rows that the stream then reads.
+        async fn fetches_before_first_poll(eager: u64) -> (Vec<u64>, usize) {
+            let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+            let (schema, len) = write_file(&store).await;
+            let fetches = Arc::new(Mutex::new(vec![]));
+            let factory = RecordingReaderFactory {
+                inner: DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
+                fetches: Arc::clone(&fetches),
+            };
+            let pool: Arc<dyn MemoryPool> =
+                Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+            let morselizer = ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(schema)
+                .with_projection_indices(&[0, 1])
+                .with_parquet_file_reader_factory(Arc::new(factory))
+                .with_read_ahead_bytes(WINDOW)
+                .with_read_ahead_eager_bytes(eager)
+                .with_memory_pool(Arc::clone(&pool))
+                .build();
+            let file = PartitionedFile::new("read_ahead.parquet".to_string(), len as u64);
+            let stream = open_file(&morselizer, file).await.unwrap();
+            // The spawned fetch runs without the stream being polled.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let before = fetches.lock().unwrap().clone();
+            let (_batches, rows) = count_batches_and_rows(stream).await;
+            drop(morselizer);
+            assert_eq!(pool.reserved(), 0, "the stream returns all it reserved");
+            (before, rows)
+        }
+
+        /// Verifies that eager read-ahead fetches data before the stream is
+        /// polled, within its limit, and that the scan still reads every row.
+        #[tokio::test]
+        async fn eager_read_ahead_fetches_before_the_first_poll() {
+            let (before, rows) = fetches_before_first_poll(0).await;
+            assert!(
+                before.is_empty(),
+                "no data fetch without eager read-ahead: {before:?}"
+            );
+            assert_eq!(rows, ROWS as usize);
+
+            let eager = WINDOW / 2;
+            let (before, rows) = fetches_before_first_poll(eager).await;
+            assert_eq!(before.len(), 1, "one eager fetch: {before:?}");
+            assert!(before[0] > 0 && before[0] <= eager, "{before:?}");
+            assert_eq!(rows, ROWS as usize);
         }
 
         fn concat(batches: &[RecordBatch]) -> RecordBatch {

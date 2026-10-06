@@ -1598,13 +1598,47 @@ impl PushDecoderStreamState {
             return;
         }
         let current = read_ahead.current_row_group;
-        let mut ranges = read_ahead.take_ranges(
+        let ranges = read_ahead.take_ranges(
             free,
             keep_row_group(current, &self.rg_plan, self.row_group_pruner.as_mut()),
         );
         if ranges.is_empty() {
             return;
         }
+        self.spawn_read_ahead(ranges);
+    }
+
+    /// Start the first read-ahead fetch now, before the stream is polled,
+    /// with at most `limit` bytes (and at most the window).
+    ///
+    /// A file that waits behind the file being read thus has its first data
+    /// in flight, and the scan does not wait a full round trip when it
+    /// reaches that file.
+    ///
+    /// Planned ranges are taken in order while they fit. Thus if the first
+    /// planned range is bigger than `limit`, this fetches nothing.
+    pub(crate) fn start_eager_read_ahead(&mut self, limit: u64) {
+        let Some(read_ahead) = self.read_ahead.as_mut() else {
+            return;
+        };
+        if limit == 0 || read_ahead.in_flight.is_some() || self.reader.is_none() {
+            return;
+        }
+        let free = limit.min(read_ahead.window);
+        let current = read_ahead.current_row_group;
+        let ranges = read_ahead.take_ranges(
+            free,
+            keep_row_group(current, &self.rg_plan, self.row_group_pruner.as_mut()),
+        );
+        if ranges.is_empty() {
+            return;
+        }
+        read_ahead.first_fetch = false;
+        self.spawn_read_ahead(ranges);
+    }
+
+    /// Spawn a background fetch of `ranges` with the idle reader.
+    fn spawn_read_ahead(&mut self, mut ranges: Vec<TaggedRange>) {
         ranges.sort_by_key(|(range, _)| range.start);
         let fetch: Vec<Range<u64>> = ranges.iter().map(|(r, _)| r.clone()).collect();
         let bytes = fetch.iter().map(|r| r.end - r.start).sum();
@@ -1613,7 +1647,10 @@ impl PushDecoderStreamState {
             let data = reader.get_byte_ranges(fetch).await;
             (reader, data)
         });
-        read_ahead.in_flight = Some(InFlight {
+        self.read_ahead
+            .as_mut()
+            .expect("streaming policy")
+            .in_flight = Some(InFlight {
             task,
             ranges,
             bytes,

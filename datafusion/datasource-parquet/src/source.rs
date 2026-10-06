@@ -725,6 +725,7 @@ impl ParquetSource {
                 .global
                 .read_ahead_bytes
                 .map(|bytes| bytes as u64),
+            read_ahead_eager_bytes: 0,
             reverse_row_groups: self.reverse_row_groups,
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             virtual_state,
@@ -783,12 +784,14 @@ impl FileSource for ParquetSource {
             .global
             .read_ahead_bytes
             .map(|_| Arc::clone(context.memory_pool()));
-        Ok(Box::new(self.build_morselizer(
-            object_store,
-            base_config,
-            partition,
-            memory_pool,
-        )?))
+        let mut morselizer =
+            self.build_morselizer(object_store, base_config, partition, memory_pool)?;
+        morselizer.read_ahead_eager_bytes = context
+            .session_config()
+            .options()
+            .execution
+            .read_ahead_eager_bytes as u64;
+        Ok(Box::new(morselizer))
     }
 
     fn reorder_files(
