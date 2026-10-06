@@ -761,6 +761,14 @@ impl DataSource for FileScanConfig {
             .with_shared_work_source(shared_work_source)
             .with_morselizer(morselizer)
             .with_metrics(source.metrics())
+            .with_open_ahead(
+                context
+                    .session_config()
+                    .options()
+                    .execution
+                    .file_open_ahead
+                    .get(),
+            )
             .build()?;
         Ok(Box::pin(cooperative(stream)))
     }

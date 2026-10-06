@@ -35,6 +35,7 @@ pub struct FileStreamBuilder<'a> {
     metrics: Option<&'a ExecutionPlanMetricsSet>,
     on_error: OnError,
     shared_work_source: Option<SharedWorkSource>,
+    open_ahead: usize,
 }
 
 impl<'a> FileStreamBuilder<'a> {
@@ -47,6 +48,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics: None,
             on_error: OnError::Fail,
             shared_work_source: None,
+            open_ahead: 1,
         }
     }
 
@@ -93,6 +95,14 @@ impl<'a> FileStreamBuilder<'a> {
         self
     }
 
+    /// Configure how many files the stream opens at the same time.
+    ///
+    /// Values below 1 are treated as 1.
+    pub fn with_open_ahead(mut self, open_ahead: usize) -> Self {
+        self.open_ahead = open_ahead.max(1);
+        self
+    }
+
     /// Build the configured [`FileStream`].
     pub fn build(self) -> Result<FileStream> {
         let Self {
@@ -102,6 +112,7 @@ impl<'a> FileStreamBuilder<'a> {
             metrics,
             on_error,
             shared_work_source,
+            open_ahead,
         } = self;
 
         let Some(partition) = partition else {
@@ -131,6 +142,7 @@ impl<'a> FileStreamBuilder<'a> {
             morselizer,
             on_error,
             file_stream_metrics,
+            open_ahead,
         ));
 
         Ok(FileStream {

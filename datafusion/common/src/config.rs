@@ -1112,6 +1112,13 @@ config_namespace! {
         /// unaffected and always keep the fallback.
         pub enable_nlj_coordinated_fallback: bool, default = true
 
+        /// Number of files each file scan partition opens at the same time.
+        /// Opening a file reads its metadata, such as the Parquet footer, page
+        /// index and Bloom filters. Only the first open file streams data, so
+        /// a value above 1 overlaps metadata I/O without decoding more files
+        /// at once. 1 opens one file at a time.
+        pub file_open_ahead: ConfigNonZeroUsize, default = non_zero_usize_default(1)
+
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: ConfigNonZeroUsize, default = non_zero_usize_default(32)
 
