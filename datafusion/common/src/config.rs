@@ -1119,6 +1119,15 @@ config_namespace! {
         /// at once. 1 opens one file at a time.
         pub file_open_ahead: ConfigNonZeroUsize, default = non_zero_usize_default(1)
 
+        /// Bytes of data that a Parquet file stream fetches as soon as the
+        /// stream is built, before the scan reads from it. With
+        /// `file_open_ahead` above 1, the files behind the file being read
+        /// thus start their data reads early. Each file takes at most this
+        /// many bytes, as speculative read-ahead from the memory pool. It
+        /// has an effect only when `parquet.read_ahead_bytes` is set. 0
+        /// turns it off.
+        pub read_ahead_eager_bytes: usize, default = 0
+
         /// Number of files to read in parallel when inferring schema and statistics
         pub meta_fetch_concurrency: ConfigNonZeroUsize, default = non_zero_usize_default(32)
 
