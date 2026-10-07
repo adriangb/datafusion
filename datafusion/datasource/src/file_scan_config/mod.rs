@@ -59,6 +59,8 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
+#[cfg(test)]
+use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType,
     display::{ProjectSchemaDisplay, display_orderings},
@@ -66,8 +68,6 @@ use datafusion_physical_plan::{
     metrics::ExecutionPlanMetricsSet,
     repartition::round_robin_beneficial_for_rows,
 };
-#[cfg(test)]
-use datafusion_physical_plan::filter_pushdown::PushedDown;
 use log::{debug, warn};
 use std::any::Any;
 use std::{fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};

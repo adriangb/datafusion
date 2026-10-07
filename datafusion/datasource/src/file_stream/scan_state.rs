@@ -213,6 +213,9 @@ impl ScanState {
 
         // Open more files. A morselizer only does CPU work here.
         while self.open_files.len() < self.open_ahead {
+            if !self.open_files.is_empty() && !self.morselizer.can_open_ahead() {
+                break;
+            }
             let Some(part_file) = self.work_source.pop_front() else {
                 break;
             };
