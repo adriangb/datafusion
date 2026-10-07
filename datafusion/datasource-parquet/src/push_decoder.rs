@@ -39,6 +39,8 @@ use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+
+use object_store::OBJECT_STORE_COALESCE_DEFAULT;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
@@ -1330,6 +1332,12 @@ impl PrefetchBudget {
         }
     }
 
+    /// Charge bytes past the budget without a grant of their own. The caller
+    /// adds them to a grant that it holds.
+    fn charge_extra(&self, bytes: u64) {
+        self.remaining.fetch_sub(to_i64(bytes), Ordering::AcqRel);
+    }
+
     fn give_back(&self, bytes: u64) {
         self.remaining.fetch_add(to_i64(bytes), Ordering::AcqRel);
     }
@@ -1344,6 +1352,31 @@ impl PrefetchBudget {
     pub(crate) fn remaining(&self) -> i64 {
         self.remaining.load(Ordering::Acquire)
     }
+}
+
+/// The bytes that an object store reads for `ranges`: the spans after it
+/// merges ranges that are at most [`OBJECT_STORE_COALESCE_DEFAULT`] apart.
+fn coalesced_bytes(ranges: impl Iterator<Item = Range<u64>>) -> u64 {
+    let mut ranges: Vec<Range<u64>> = ranges.collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut total = 0;
+    let mut current: Option<Range<u64>> = None;
+    for range in ranges {
+        current = match current {
+            Some(span)
+                if range.start
+                    <= span.end.saturating_add(OBJECT_STORE_COALESCE_DEFAULT) =>
+            {
+                Some(span.start..span.end.max(range.end))
+            }
+            Some(span) => {
+                total += span.end - span.start;
+                Some(range)
+            }
+            None => Some(range),
+        };
+    }
+    total + current.map_or(0, |span| span.end - span.start)
 }
 
 fn to_i64(bytes: u64) -> i64 {
@@ -1765,9 +1798,14 @@ impl PushDecoderStreamState {
         let bytes: u64 = ranges.iter().map(|(r, _)| r.end - r.start).sum();
         let grant = budget.map(|budget| {
             budget.give_back(free - bytes);
+            // The object store merges nearby ranges into one read, and each
+            // returned slice keeps its whole merged read alive. Thus the fetch
+            // holds the merged spans, not only the planned bytes.
+            let held = coalesced_bytes(ranges.iter().map(|(r, _)| r.clone()));
+            budget.charge_extra(held.saturating_sub(bytes));
             PrefetchGrant {
                 budget: Arc::clone(budget),
-                bytes,
+                bytes: held.max(bytes),
             }
         });
         if ranges.is_empty() {
@@ -1924,6 +1962,16 @@ impl PushDecoderStreamState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coalesced_bytes_merges_ranges_within_the_store_gap() {
+        let mib = 1024 * 1024;
+        // Two ranges 0.5 MiB apart merge into one 2.5 MiB span; a third 3 MiB
+        // later stays apart.
+        let ranges = [0..mib, mib + mib / 2..2 * mib + mib / 2, 6 * mib..7 * mib];
+        assert_eq!(coalesced_bytes(ranges.into_iter()), 2 * mib + mib / 2 + mib);
+        assert_eq!(coalesced_bytes(std::iter::empty()), 0);
+    }
+
     use super::*;
 
     use arrow::array::{Int64Array, RecordBatch};
