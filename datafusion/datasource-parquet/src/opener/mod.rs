@@ -37,8 +37,9 @@ use crate::metrics::{
 use crate::optional_filter::OptionalFilterOptions;
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
-    DecoderBuilderConfig, InitialDecoderState, PrefetchBudget, PushDecoderStreamState,
-    ReadAhead, ReadAheadMemory, RgPlanEntry, RowFilterContext, RowGroupPruner,
+    DecoderBuilderConfig, InitialDecoderState, PrefetchBudget, PrefetchGrant,
+    PushDecoderStreamState, ReadAhead, ReadAheadMemory, RgPlanEntry, RowFilterContext,
+    RowGroupPruner,
 };
 use crate::row_filter::{OptionalFilterRowFilterContext, PrebuiltRowFilterCandidate};
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
@@ -364,6 +365,14 @@ impl Morselizer for ParquetMorselizer {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
         Ok(Box::new(ParquetMorselPlanner::try_new(self, file)?))
     }
+
+    /// With a prefetch budget, open files ahead only while the budget has
+    /// bytes left. The decoded metadata of each open file is charged to it.
+    fn can_open_ahead(&self) -> bool {
+        self.read_ahead_prefetch_budget
+            .as_ref()
+            .is_none_or(|budget| budget.has_capacity())
+    }
 }
 
 /// States for [`ParquetMorselPlanner`]
@@ -468,6 +477,10 @@ impl fmt::Debug for ParquetOpenState {
 
 struct PreparedParquetOpen {
     partition_index: usize,
+    /// The estimated metadata of this file, charged to the prefetch budget
+    /// from the time the scan opens the file until its stream charges the
+    /// real metadata. `None` without a budget.
+    open_grant: Option<PrefetchGrant>,
     partitioned_file: PartitionedFile,
     /// Tracks how much of this file range the scan has finished with.
     ///
@@ -1151,6 +1164,10 @@ impl ParquetMorselizer {
 
         Ok(PreparedParquetOpen {
             partition_index: self.partition_index,
+            open_grant: self
+                .read_ahead_prefetch_budget
+                .as_ref()
+                .map(|budget| budget.reserve_open()),
             byte_progress,
             partitioned_file,
             file_range,
@@ -1815,12 +1832,15 @@ impl RowGroupsPrunedParquetOpen {
             page_pruning_predicate,
         } = prepared;
         let MetadataLoadedParquetOpen {
-            prepared,
+            mut prepared,
             reader_metadata,
             options: _,
         } = loaded;
 
         let file_metadata = Arc::clone(reader_metadata.metadata());
+        let metadata_bytes = file_metadata.memory_size() as u64;
+        // The real metadata is charged with the stream below.
+        drop(prepared.open_grant.take());
         let rg_metadata = file_metadata.row_groups();
 
         // Prune by limit if limit is set and limit order is not sensitive
@@ -2166,6 +2186,9 @@ impl RowGroupsPrunedParquetOpen {
             flush_at_row_group_boundary: watches_dynamic_filter,
             projection_builder,
             read_ahead,
+            _metadata_grant: read_ahead_prefetch_budget
+                .as_ref()
+                .map(|budget| budget.charge_metadata(metadata_bytes)),
         };
         stream_state.start_eager_read_ahead(
             read_ahead_eager_bytes,
@@ -7298,14 +7321,16 @@ mod test {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let before = fetches.lock().unwrap().clone();
             assert_eq!(before.len(), 1, "only the first file fits: {before:?}");
-            assert_eq!(budget.remaining(), budget_bytes - before[0]);
+            let budget_bytes = budget_bytes as i64;
+            // Both open files also hold their decoded metadata.
+            let while_open = budget.remaining();
+            assert!(while_open < budget_bytes - before[0] as i64, "{while_open}");
 
             let (_batches, rows) = count_batches_and_rows(first).await;
             assert_eq!(rows, ROWS as usize);
-            assert_eq!(
-                budget.remaining(),
-                budget_bytes,
-                "the first file gave its bytes back"
+            assert!(
+                budget.remaining() > while_open + before[0] as i64,
+                "the first file gave back its eager fetch and its metadata"
             );
             let (_batches, rows) = count_batches_and_rows(second).await;
             assert_eq!(rows, ROWS as usize);

@@ -66,6 +66,13 @@ pub trait Morselizer: Send + Sync + Debug {
     /// work, such as reading from the file. Any needed I/O should be done using
     /// [`MorselPlan::with_pending_planner`].
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>>;
+
+    /// Whether the scan may open another file while it already has files
+    /// open. The scan always opens a file when it has none open. The default
+    /// is `true`: the scan opens up to `file_open_ahead` files.
+    fn can_open_ahead(&self) -> bool {
+        true
+    }
 }
 
 /// A Morsel Planner is responsible for creating morsels for a given scan.
