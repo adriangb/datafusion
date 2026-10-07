@@ -38,7 +38,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use object_store::OBJECT_STORE_COALESCE_DEFAULT;
 use std::time::Duration;
@@ -378,9 +378,6 @@ pub(crate) struct PushDecoderStreamState {
     /// Read-ahead, set by `read_ahead_bytes`. See
     /// [`Self::transition_streaming`].
     pub(crate) read_ahead: Option<ReadAhead>,
-    /// The decoded metadata of this file, charged to the prefetch budget
-    /// while the stream is alive. `None` without a budget.
-    pub(crate) _metadata_grant: Option<PrefetchGrant>,
 }
 
 /// A reusable, `Arc`-shared list of prebuilt row-filter candidates.
@@ -1260,45 +1257,13 @@ struct InFlight {
 pub(crate) struct PrefetchBudget {
     /// Can go below zero: [`Self::charge`] always succeeds.
     remaining: AtomicI64,
-    /// Decoded metadata bytes and files charged so far, for
-    /// [`Self::reserve_open`].
-    metadata_bytes: AtomicU64,
-    metadata_files: AtomicU64,
 }
-
-/// The metadata estimate of a file before any file of the scan has loaded
-/// its metadata.
-const DEFAULT_METADATA_ESTIMATE: u64 = 1024 * 1024;
 
 impl PrefetchBudget {
     pub(crate) fn new(bytes: u64) -> Self {
         Self {
             remaining: AtomicI64::new(to_i64(bytes)),
-            metadata_bytes: AtomicU64::new(0),
-            metadata_files: AtomicU64::new(0),
         }
-    }
-
-    /// Charge the estimated metadata of a file that the scan opens now. The
-    /// file holds this grant until it charges its real metadata with
-    /// [`Self::charge_metadata`]. Thus the scan sees the cost of a file as
-    /// soon as it opens it, before its metadata is loaded.
-    pub(crate) fn reserve_open(self: &Arc<Self>) -> PrefetchGrant {
-        let files = self.metadata_files.load(Ordering::Acquire);
-        let estimate = if files == 0 {
-            DEFAULT_METADATA_ESTIMATE
-        } else {
-            self.metadata_bytes.load(Ordering::Acquire) / files
-        };
-        self.charge(estimate)
-    }
-
-    /// Charge the decoded metadata of an open file, and use it for later
-    /// estimates.
-    pub(crate) fn charge_metadata(self: &Arc<Self>, bytes: u64) -> PrefetchGrant {
-        self.metadata_bytes.fetch_add(bytes, Ordering::AcqRel);
-        self.metadata_files.fetch_add(1, Ordering::AcqRel);
-        self.charge(bytes)
     }
 
     /// Take at most `max` bytes, and only bytes that are left. Returns the
@@ -1320,18 +1285,6 @@ impl PrefetchBudget {
         }
     }
 
-    /// Charge `bytes` that a file holds while it is open, such as its
-    /// decoded metadata. This always succeeds, even past the budget, so that
-    /// a file that is open never waits. The bytes come back when the grant
-    /// is dropped.
-    pub(crate) fn charge(self: &Arc<Self>, bytes: u64) -> PrefetchGrant {
-        self.remaining.fetch_sub(to_i64(bytes), Ordering::AcqRel);
-        PrefetchGrant {
-            budget: Arc::clone(self),
-            bytes,
-        }
-    }
-
     /// Charge bytes past the budget without a grant of their own. The caller
     /// adds them to a grant that it holds.
     fn charge_extra(&self, bytes: u64) {
@@ -1340,12 +1293,6 @@ impl PrefetchBudget {
 
     fn give_back(&self, bytes: u64) {
         self.remaining.fetch_add(to_i64(bytes), Ordering::AcqRel);
-    }
-
-    /// Whether bytes are left. A scan opens files ahead only while this is
-    /// true.
-    pub(crate) fn has_capacity(&self) -> bool {
-        self.remaining.load(Ordering::Acquire) > 0
     }
 
     #[cfg(test)]
