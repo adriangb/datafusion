@@ -31,7 +31,9 @@ use crate::decoder_projection::{
 #[cfg(test)]
 use crate::filter_placement::PlacementSites;
 use crate::filter_placement::{FilePlacement, PlacementOptions};
-use crate::metrics::{ByteProgress, RowFilterSkippedFullyMatchedMetric};
+use crate::metrics::{
+    ByteProgress, ReadAheadMetrics, RowFilterSkippedFullyMatchedMetric,
+};
 use crate::optional_filter::OptionalFilterOptions;
 use crate::page_filter::PagePruningAccessPlanFilter;
 use crate::push_decoder::{
@@ -2109,7 +2111,12 @@ impl RowGroupsPrunedParquetOpen {
         let read_ahead = read_ahead_bytes.map(|window| {
             let memory =
                 ReadAheadMemory::new(prepared.memory_pool, prepared.partition_index);
-            ReadAhead::new(window, decoder.scan_plan(), memory)
+            let metrics = ReadAheadMetrics::new(
+                &prepared.metrics,
+                prepared.partition_index,
+                &prepared.file_name,
+            );
+            ReadAhead::new(window, decoder.scan_plan(), memory, metrics)
         });
         let stream = PushDecoderStreamState {
             decoder: Some(decoder),
@@ -7124,6 +7131,8 @@ mod test {
         }
 
         struct Scan {
+            /// The metrics of the scan.
+            metrics: ExecutionPlanMetricsSet,
             batches: Vec<RecordBatch>,
             /// Bytes of each data fetch.
             fetches: Vec<u64>,
@@ -7143,10 +7152,12 @@ mod test {
                 inner: DefaultParquetFileReaderFactory::new(Arc::clone(&store)),
                 fetches: Arc::clone(&fetches),
             };
+            let metrics = ExecutionPlanMetricsSet::new();
             let mut builder = ParquetMorselizerBuilder::new()
                 .with_store(Arc::clone(&store))
                 .with_schema(Arc::clone(&schema))
                 .with_projection_indices(&[0, 1])
+                .with_metrics(metrics.clone())
                 .with_parquet_file_reader_factory(Arc::new(factory));
             if let Some(predicate) = predicate {
                 builder = builder
@@ -7174,6 +7185,7 @@ mod test {
             }
             let fetches = fetches.lock().unwrap().clone();
             Scan {
+                metrics,
                 batches,
                 fetches,
                 reserved,
@@ -7237,6 +7249,40 @@ mod test {
             let required_only = scan(Some(full), Some(a_lt(-1))).await;
             assert!(bytes(&ahead) > bytes(&baseline));
             assert_eq!(bytes(&required_only), bytes(&baseline));
+        }
+
+        /// The value of a metric of the scan, or `None` if the scan did not
+        /// register it.
+        fn metric(scan: &Scan, name: &str) -> Option<usize> {
+            scan.metrics
+                .clone_inner()
+                .sum_by_name(name)
+                .map(|value| value.as_usize())
+        }
+
+        /// `read_ahead_bytes_fetched` counts the bytes fetched before the
+        /// decoder asked for them. A scan without read-ahead registers
+        /// neither read-ahead metric.
+        #[tokio::test]
+        async fn metrics_report_the_bytes_fetched_ahead() {
+            let bytes = |scan: &Scan| scan.fetches.iter().sum::<u64>() as usize;
+            let baseline = scan(None, Some(a_lt(-1))).await;
+            assert_eq!(metric(&baseline, "read_ahead_bytes_fetched"), None);
+            assert_eq!(metric(&baseline, "read_ahead_wait_time"), None);
+
+            // The filter rejects every row, so the decoder never asks for
+            // `b`. All the bytes above the baseline were fetched ahead.
+            let unbounded: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1 << 30));
+            let ahead = scan(Some(unbounded), Some(a_lt(-1))).await;
+            let fetched_ahead = metric(&ahead, "read_ahead_bytes_fetched").unwrap();
+            assert!(fetched_ahead >= bytes(&ahead) - bytes(&baseline));
+            assert!(fetched_ahead <= bytes(&ahead));
+            assert!(metric(&ahead, "read_ahead_wait_time").is_some());
+
+            // A pool with no room grants no speculative bytes.
+            let full: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1));
+            let required_only = scan(Some(full), Some(a_lt(-1))).await;
+            assert_eq!(metric(&required_only, "read_ahead_bytes_fetched"), Some(0));
         }
     }
 }
