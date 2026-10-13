@@ -15,7 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-
 # Tests for `datafusion.optimizer.enable_automatic_cte_materialization`: the
 # SQL planner plans each CTE without a directive as an automatic materialized
 # CTE, and the optimizer rule `inline_automatic_ctes` decides which of them
