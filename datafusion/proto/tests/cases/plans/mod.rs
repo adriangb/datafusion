@@ -41,6 +41,7 @@ mod filters;
 mod joins;
 mod leaves;
 mod limits;
+mod materialized_cte;
 mod misc;
 mod scalar_subquery;
 mod sinks;
