@@ -1635,6 +1635,16 @@ config_namespace! {
         /// past window functions, if possible
         pub enable_window_limits: bool, default = true
 
+        /// When set to true, the SQL planner plans each non-recursive CTE that
+        /// has no `MATERIALIZED` or `NOT MATERIALIZED` directive as a
+        /// materialized CTE, and the optimizer rule `inline_automatic_ctes`
+        /// decides which of them stay materialized. A CTE stays materialized,
+        /// and is computed one time, when it has more than one reference and
+        /// its body is not volatile and is more than projections and filters
+        /// on one table. All other CTEs are inlined at each reference.
+        /// When set to false, a CTE is materialized only with `AS MATERIALIZED`.
+        pub enable_automatic_cte_materialization: bool, default = false
+
         /// When set to true, the optimizer will replace
         /// Filter(rn<=K) → Window(ROW_NUMBER) → Sort patterns with a
         /// PartitionedTopKExec that maintains per-partition heaps, avoiding

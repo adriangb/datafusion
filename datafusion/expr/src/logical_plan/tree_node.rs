@@ -382,6 +382,7 @@ impl TreeNode for LogicalPlan {
                 name,
                 cte,
                 continuation,
+                automatic,
             }) => {
                 (cte, continuation)
                     .map_elements(f)?
@@ -391,6 +392,7 @@ impl TreeNode for LogicalPlan {
                             name,
                             cte,
                             continuation,
+                            automatic,
                         })
                     })
             }

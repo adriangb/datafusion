@@ -2451,8 +2451,16 @@ impl LogicalPlan {
                     LogicalPlan::Analyze { .. } => write!(f, "Analyze"),
                     LogicalPlan::Union(_) => write!(f, "Union"),
                     LogicalPlan::Extension(e) => e.node.fmt_for_explain(f),
-                    LogicalPlan::MaterializedCte(MaterializedCte { name, .. }) => {
-                        write!(f, "MaterializedCte: name={name}")
+                    LogicalPlan::MaterializedCte(MaterializedCte {
+                        name,
+                        automatic,
+                        ..
+                    }) => {
+                        write!(f, "MaterializedCte: name={name}")?;
+                        if *automatic {
+                            write!(f, ", automatic=true")?;
+                        }
+                        Ok(())
                     }
                     LogicalPlan::MaterializedCteScan(MaterializedCteScan {
                         name,
