@@ -28,7 +28,9 @@ use crate::utils::{NamePreserver, merge_into_schema};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use arrow::temporal_conversions::SECONDS_IN_DAY;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
+use datafusion_common::tree_node::{
+    Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, TableReference,
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err,
@@ -56,9 +58,10 @@ use datafusion_expr::type_coercion::{
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
     AsOfJoin, AsOfMatch, Cast, DmlStatement, Expr, ExprSchemable, Join, Limit,
-    LogicalPlan, Operator, Projection, Union, ValueOrLambda, WindowFrame,
-    WindowFrameBound, WindowFrameUnits, WriteOp, is_false, is_not_false, is_not_true,
-    is_not_unknown, is_true, is_unknown, lit, not,
+    LogicalPlan, MaterializedCte, MaterializedCteId, MaterializedCteScan, Operator,
+    Projection, Union, ValueOrLambda, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WriteOp, is_false, is_not_false, is_not_true, is_not_unknown, is_true, is_unknown,
+    lit, not,
 };
 
 /// Performs type coercion by determining the schema
@@ -96,22 +99,93 @@ impl AnalyzerRule for TypeCoercion {
     }
 
     fn analyze(&self, plan: LogicalPlan, config: &ConfigOptions) -> Result<LogicalPlan> {
-        static EMPTY_SCHEMA: LazyLock<DFSchema> = LazyLock::new(DFSchema::empty);
-
         // recurse
-        let transformed_plan = plan
-            .transform_up_with_subqueries(|plan| {
-                analyze_internal(
-                    &EMPTY_SCHEMA,
-                    plan,
-                    config.execution.time_zone.as_ref().map(|tz| tz.as_str()),
-                )
-            })?
-            .data;
+        let transformed_plan = coerce_plan_and_subqueries(plan, config)?;
 
         // finish
         coerce_output(transformed_plan, config)
     }
+}
+
+/// Coerce each node of `plan` and of its subqueries, from the leaves up.
+fn coerce_plan_and_subqueries(
+    plan: LogicalPlan,
+    config: &ConfigOptions,
+) -> Result<LogicalPlan> {
+    static EMPTY_SCHEMA: LazyLock<DFSchema> = LazyLock::new(DFSchema::empty);
+
+    plan.transform_down_up_with_subqueries(
+        |plan| match plan {
+            // Coercion can change the types of the body, for example the type
+            // of a `NULL` column of a `UNION`. Coerce the body first, and give
+            // its new schema to the scans before the continuation is coerced.
+            LogicalPlan::MaterializedCte(cte) => {
+                let body =
+                    coerce_plan_and_subqueries(Arc::unwrap_or_clone(cte.cte), config)?;
+                let continuation = with_materialized_cte_scan_schema(
+                    Arc::unwrap_or_clone(cte.continuation),
+                    cte.id,
+                    body.schema(),
+                )?;
+                let continuation = coerce_plan_and_subqueries(continuation, config)?;
+                Ok(Transformed::new(
+                    LogicalPlan::MaterializedCte(MaterializedCte {
+                        cte: Arc::new(body),
+                        continuation: Arc::new(continuation),
+                        ..cte
+                    }),
+                    true,
+                    TreeNodeRecursion::Jump,
+                ))
+            }
+            _ => Ok(Transformed::no(plan)),
+        },
+        |plan| {
+            analyze_internal(
+                &EMPTY_SCHEMA,
+                plan,
+                config.execution.time_zone.as_ref().map(|tz| tz.as_str()),
+            )
+        },
+    )
+    .map(|t| t.data)
+}
+
+/// Give the fields of `body_schema` to each scan of the materialized CTE `id`
+/// in `continuation`, also in subquery expressions. A scan keeps its
+/// qualifiers.
+fn with_materialized_cte_scan_schema(
+    continuation: LogicalPlan,
+    id: MaterializedCteId,
+    body_schema: &DFSchemaRef,
+) -> Result<LogicalPlan> {
+    continuation
+        .transform_down_with_subqueries(|node| match node {
+            // A nested occurrence of the same CTE owns the scans below it.
+            LogicalPlan::MaterializedCte(ref nested) if nested.id == id => {
+                Ok(Transformed::new(node, false, TreeNodeRecursion::Jump))
+            }
+            LogicalPlan::MaterializedCteScan(scan)
+                if scan.id == id && scan.schema.inner() != body_schema.inner() =>
+            {
+                let qualifiers = scan.schema.iter().map(|(q, _)| q.cloned()).collect();
+                let schema = DFSchema::from_field_specific_qualified_schema(
+                    qualifiers,
+                    body_schema.inner(),
+                )?
+                .with_functional_dependencies(
+                    body_schema.functional_dependencies().clone(),
+                )?;
+                Ok(Transformed::yes(LogicalPlan::MaterializedCteScan(
+                    MaterializedCteScan {
+                        schema: Arc::new(schema),
+                        ..scan
+                    },
+                )))
+            }
+            _ => Ok(Transformed::no(node)),
+        })
+        .map(|t| t.data)
 }
 
 /// use the external schema to handle the correlated subqueries case
