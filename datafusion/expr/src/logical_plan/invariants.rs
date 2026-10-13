@@ -355,6 +355,9 @@ fn check_inner_plan(inner_plan: &LogicalPlan) -> Result<()> {
             }
         },
         LogicalPlan::Extension(_) => Ok(()),
+        // A materialized CTE is not checked, as when it was an extension
+        // node. `PullUpCorrelatedExpr` rewrites its continuation, or stops.
+        LogicalPlan::MaterializedCte(_) => Ok(()),
         plan => check_no_outer_references(plan),
     }
 }

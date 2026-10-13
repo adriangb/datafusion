@@ -365,8 +365,18 @@ fn optimize_projections(
                     .collect()
             }
         }
+        LogicalPlan::MaterializedCte(cte) => {
+            // The scans are leaves whose schema is the schema of the body, so
+            // the body keeps every column. The output is the output of the
+            // continuation, so the continuation needs what the parent needs.
+            vec![
+                RequiredIndices::new_for_all_exprs(&cte.cte),
+                RequiredIndices::new_from_indices(indices.into_inner()),
+            ]
+        }
         LogicalPlan::EmptyRelation(_)
         | LogicalPlan::Values(_)
+        | LogicalPlan::MaterializedCteScan(_)
         | LogicalPlan::DescribeTable(_) => {
             // These operators have no inputs, so stop the optimization process.
             return Ok(Transformed::no(plan));

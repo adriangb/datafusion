@@ -77,5 +77,11 @@ pub fn to_substrait_rel(
         LogicalPlan::RecursiveQuery(plan) => {
             not_impl_err!("Unsupported plan type: {plan:?}")?
         }
+        LogicalPlan::MaterializedCte(plan) => {
+            not_impl_err!("Substrait MATERIALIZED CTE is not supported: {plan:?}")?
+        }
+        LogicalPlan::MaterializedCteScan(plan) => {
+            not_impl_err!("Substrait MATERIALIZED CTE is not supported: {plan:?}")?
+        }
     }
 }
