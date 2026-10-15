@@ -1789,7 +1789,12 @@ impl PushDecoderStreamState {
         ranges.sort_by_key(|(range, _)| range.start);
         let fetch: Vec<Range<u64>> = ranges.iter().map(|(r, _)| r.clone()).collect();
         let bytes = fetch.iter().map(|r| r.end - r.start).sum();
-        read_ahead.metrics.bytes_fetched.add(to_usize(bytes));
+        self.read_ahead
+            .as_ref()
+            .expect("streaming policy")
+            .metrics
+            .bytes_fetched
+            .add(to_usize(bytes));
         let mut reader = self.reader.take().expect("reader is idle");
         let task = SpawnedTask::spawn(async move {
             let data = reader.get_byte_ranges(fetch).await;
