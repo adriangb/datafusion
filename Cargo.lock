@@ -2580,6 +2580,7 @@ dependencies = [
  "loom",
  "num-traits",
  "parking_lot 0.13.0",
+ "parquet",
  "pin-project-lite",
  "rand 0.9.4",
  "rstest",
