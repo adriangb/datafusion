@@ -116,11 +116,26 @@ pub(crate) fn partition_filter(
     {
         return Ok(None);
     }
-    let mut filter = Sbbf::new_with_num_of_bytes(bytes);
-    for_each_hash_batch(keys, |hashes| {
-        filter.insert_hashes(hashes);
+    // Insert the hashes in sorted order: the block of a hash grows with the
+    // hash, so the inserts write the filter in order instead of missing the
+    // cache on every key of a filter larger than the cache.
+    let num_rows = keys.first().map_or(0, |k| k.len());
+    let hashes_bytes = num_rows * size_of::<u64>();
+    if reservation.try_grow(hashes_bytes).is_err() {
+        reservation.shrink(bytes.max(32).next_power_of_two());
+        return Ok(None);
+    }
+    let mut hashes = Vec::with_capacity(num_rows);
+    for_each_hash_batch(keys, |batch| {
+        hashes.extend_from_slice(batch);
         Ok(())
     })?;
+    hashes.sort_unstable();
+    hashes.dedup();
+    let mut filter = Sbbf::new_with_num_of_bytes(bytes);
+    filter.insert_hashes(&hashes);
+    drop(hashes);
+    reservation.shrink(hashes_bytes);
     Ok(Some(filter))
 }
 
