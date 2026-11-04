@@ -190,6 +190,15 @@ fn merge(
         }
     }
     filter.fold_to_target_fpp(options.fpp);
+    // Prototype instrumentation for the benchmarks
+    if std::env::var_os("DF_BLOOM_TRACE").is_some() {
+        eprintln!(
+            "bloom_merge partitions={} bytes={} fpp={:.5}",
+            partitions.len(),
+            filter.num_blocks() * 32,
+            filter.estimated_fpp()
+        );
+    }
     // A saturated filter costs CPU time and removes almost no rows
     if filter.estimated_fpp() > options.max_fpp {
         return Ok(None);
