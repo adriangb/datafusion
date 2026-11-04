@@ -142,15 +142,67 @@ pub(crate) fn global_filter_bytes(
     Some(bytes.min(cap))
 }
 
-/// The bloom filter of `keys` with `bytes` bytes (a power of two). Every
-/// partition uses the same size, so that the filters can be ORed.
-pub(crate) fn filter_with_bytes(keys: &[ArrayRef], bytes: usize) -> Result<Sbbf> {
+/// The hashes of the keys of one partition, in one bucket per shard of the
+/// global filter. Shard `s` of `S` holds the hashes whose top `log2(S)` bits
+/// of the block index part (the high 32 bits) are `s`.
+pub(crate) struct ShardedHashes {
+    buckets: Vec<Vec<u64>>,
+}
+
+impl ShardedHashes {
+    /// `num_shards` must be a power of two.
+    pub(crate) fn try_new(keys: &[ArrayRef], num_shards: usize) -> Result<Self> {
+        let shard_bits = num_shards.trailing_zeros();
+        let num_rows = keys.first().map_or(0, |k| k.len());
+        let mut buckets: Vec<Vec<u64>> = (0..num_shards)
+            .map(|_| Vec::with_capacity(num_rows / num_shards + 16))
+            .collect();
+        for_each_hash_batch(keys, |hashes| {
+            for &hash in hashes {
+                buckets[shard_of(hash, shard_bits)].push(hash);
+            }
+            Ok(())
+        })?;
+        Ok(Self { buckets })
+    }
+}
+
+fn shard_of(hash: u64, shard_bits: u32) -> usize {
+    if shard_bits == 0 {
+        0
+    } else {
+        ((hash >> 32) as u32 >> (32 - shard_bits)) as usize
+    }
+}
+
+/// The filter of shard `shard` of the global filter, with `bytes` bytes,
+/// from the buckets of every partition.
+///
+/// In a filter of `B = 2^b` blocks, the block of a hash is the top `b` bits
+/// of its high 32 bits. The shard is the top `log2(S)` of those bits, and the
+/// block in the shard is the next `b - log2(S)` bits. Shifting the high 32 bits
+/// left by `log2(S)` gives a hash whose block in a filter of `B / S` blocks is
+/// that block. The low 32 bits, which pick the bits in the block, stay.
+pub(crate) fn shard_filter(
+    partitions: &[Arc<ShardedHashes>],
+    shard: usize,
+    bytes: usize,
+) -> Sbbf {
+    let num_shards = partitions.first().map_or(1, |p| p.buckets.len());
+    let shard_bits = num_shards.trailing_zeros();
     let mut filter = Sbbf::new_with_num_of_bytes(bytes);
-    for_each_hash_batch(keys, |hashes| {
-        filter.insert_hashes(hashes);
-        Ok(())
-    })?;
-    Ok(filter)
+    let mut local = Vec::with_capacity(HASH_BATCH_SIZE);
+    for partition in partitions {
+        for chunk in partition.buckets[shard].chunks(HASH_BATCH_SIZE) {
+            local.clear();
+            local.extend(chunk.iter().map(|&h| {
+                let high = ((h >> 32) as u32).wrapping_shl(shard_bits) as u64;
+                (high << 32) | (h & 0xffff_ffff)
+            }));
+            filter.insert_hashes(&local);
+        }
+    }
+    filter
 }
 
 /// The bloom filter of a [`BloomFilterExpr`] and the reservation for its
@@ -185,7 +237,8 @@ fn merge(
     }
     let mut filter = first.clone();
     for (i, partition) in partitions.iter().enumerate() {
-        if i != smallest {
+        // Partitions can share one filter (see `ShardedHashes`)
+        if i != smallest && !std::ptr::eq(*partition, first) {
             filter.union(partition).map_err(parquet_err)?;
         }
     }
@@ -620,6 +673,38 @@ mod tests {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024));
         assert!(int_expr_with(vec![(0..100_000).collect()], OPTIONS, &pool).is_none());
         assert_eq!(pool.reserved(), 0);
+    }
+
+    /// The shards side by side are the filter of all keys of all partitions.
+    #[test]
+    fn shards_concatenate_to_the_global_filter() {
+        let bytes = 64 * 1024;
+        let partitions: Vec<Vec<ArrayRef>> = (0..3)
+            .map(|p| int_keys((p * 10_000..p * 10_000 + 7_000).collect()))
+            .collect();
+        let mut expected = Sbbf::new_with_num_of_bytes(bytes);
+        for keys in &partitions {
+            for_each_hash_batch(keys, |hashes| {
+                expected.insert_hashes(hashes);
+                Ok(())
+            })
+            .unwrap();
+        }
+        let mut expected_bits = vec![];
+        expected.write_bitset(&mut expected_bits).unwrap();
+        for num_shards in [1, 2, 4, 8] {
+            let sharded: Vec<_> = partitions
+                .iter()
+                .map(|keys| Arc::new(ShardedHashes::try_new(keys, num_shards).unwrap()))
+                .collect();
+            let mut bits = vec![];
+            for shard in 0..num_shards {
+                shard_filter(&sharded, shard, bytes / num_shards)
+                    .write_bitset(&mut bits)
+                    .unwrap();
+            }
+            assert!(bits == expected_bits, "{num_shards} shards");
+        }
     }
 
     #[test]

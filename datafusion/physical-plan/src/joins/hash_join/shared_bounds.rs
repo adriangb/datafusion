@@ -13,7 +13,7 @@ use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::bloom_filter::{
-    BloomFilterExpr, BloomFilterOptions, filter_with_bytes, global_filter_bytes,
+    BloomFilterExpr, BloomFilterOptions, ShardedHashes, global_filter_bytes, shard_filter,
 };
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::not_in::NotIn;
@@ -413,26 +413,45 @@ enum CompletionState {
     Ready(SharedResult<()>),
 }
 
-/// The second barrier of a partitioned join with a bloom filter.
+/// The bloom phase of a partitioned join: one global filter, built in shards.
 ///
 /// ```text
-/// build ─ report ─┐                ┌─ fill filter ─┐
-///                 ├─ choose size ──┤               ├─ OR, fold ─ probe
-/// build ─ report ─┘                └─ fill filter ─┘
+/// build ─ report ─┐               ┌─ hash, bucket by shard ─┐   ┌─ fill shards ─┐
+///                 ├─ choose size ─┤                         ├───┤               ├─ concat ─ probe
+/// build ─ report ─┘               └─ hash, bucket by shard ─┘   └─ fill shards ─┘
 /// ```
 ///
-/// The size comes from the distinct keys of all partitions, so a partition
-/// with few keys does not shrink the filter of the others.
+/// Shard `s` is the block range `[s * B / S, (s + 1) * B / S)` of the global
+/// filter of `B` blocks. Each partition first hashes its keys and puts each
+/// hash in the bucket of its shard (the exchange). Once every partition has
+/// done that, the waiting partitions take shards one at a time and fill each
+/// shard from the buckets of every partition. No two tasks write the same
+/// block, so this needs no atomics and no OR step.
 struct BloomPhase {
     partitions: Vec<PartitionStatus>,
     bytes: usize,
-    /// `owed[i]` is `true` while partition `i` has not started its filter
+    num_shards: usize,
+    /// `owed[i]` is `true` while partition `i` has not started its buckets
     owed: Vec<bool>,
-    /// Filters not yet stored in `partitions`
-    remaining: usize,
-    /// Memory of the partition filters, released once they are ORed
+    /// Partitions whose buckets are not stored yet
+    remaining_buckets: usize,
+    buckets: Vec<Arc<ShardedHashes>>,
+    /// Next shard to fill
+    next_shard: usize,
+    /// Shards not stored yet
+    remaining_shards: usize,
+    shards: Vec<Option<Sbbf>>,
+    /// Memory of the buckets and the shards
     _reservation: MemoryReservation,
     started: datafusion_common::instant::Instant,
+    exchanged: Option<datafusion_common::instant::Instant>,
+}
+
+impl BloomPhase {
+    fn has_work(&self, partition_id: Option<usize>) -> bool {
+        partition_id.is_some_and(|id| self.owed[id])
+            || (self.remaining_buckets == 0 && self.next_shard < self.num_shards)
+    }
 }
 
 struct AccumulatorState {
@@ -586,6 +605,17 @@ impl SharedBuildAccumulator {
             })
             .collect();
         let remaining = owed.iter().filter(|o| **o).count();
+        let num_rows: usize = partitions
+            .iter()
+            .filter_map(|p| match p {
+                PartitionStatus::Reported(d) => {
+                    d.build_keys.keys.first().map(|k| k.len())
+                }
+                _ => None,
+            })
+            .sum();
+        // A power of two, so that the shard of a hash is its top bits
+        let num_shards = remaining.next_power_of_two().min(bytes / 32);
         let pool = self
             .global_filter_options
             .memory_pool
@@ -593,17 +623,23 @@ impl SharedBuildAccumulator {
             .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
         let reservation =
             MemoryConsumer::new("HashJoinBloomFilterPartitions").register(&pool);
-        if reservation.try_grow(remaining * bytes).is_err() {
+        if reservation.try_grow(num_rows * 8 + bytes).is_err() {
             return self.finish(FinalizeInput::Partitioned(partitions));
         }
         let mut guard = self.inner.lock();
         guard.completion = CompletionState::Bloom(BloomPhase {
             partitions,
             bytes,
+            num_shards,
             owed,
-            remaining,
+            remaining_buckets: remaining,
+            buckets: Vec::with_capacity(remaining),
+            next_shard: 0,
+            remaining_shards: num_shards,
+            shards: vec![None; num_shards],
             _reservation: reservation,
             started: datafusion_common::instant::Instant::now(),
+            exchanged: None,
         });
         drop(guard);
         self.completion_notify.notify_waiters();
@@ -650,11 +686,10 @@ impl SharedBuildAccumulator {
         )
     }
 
-    /// Fills the bloom filter of `partition_id` when the bloom phase still
-    /// needs it. The partition that stores the last filter builds the global
-    /// filter.
-    fn fill_bloom_filter(&self, partition_id: usize) {
-        let (keys, bytes) = {
+    /// Buckets the hashes of `partition_id` when the bloom phase still needs
+    /// them.
+    fn bucket_hashes(&self, partition_id: usize) {
+        let (keys, num_shards) = {
             let mut guard = self.inner.lock();
             let CompletionState::Bloom(phase) = &mut guard.completion else {
                 return;
@@ -663,38 +698,118 @@ impl SharedBuildAccumulator {
                 return;
             }
             let PartitionStatus::Reported(data) = &phase.partitions[partition_id] else {
-                unreachable!("only reported partitions owe a bloom filter");
+                unreachable!("only reported partitions owe buckets");
             };
-            (data.build_keys.keys.clone(), phase.bytes)
+            (data.build_keys.keys.clone(), phase.num_shards)
         };
-        // Without this filter (an error), the global filter has no bloom filter
-        let filter = filter_with_bytes(&keys, bytes).ok().map(Arc::new);
-        let finalize_input = {
+        // Hashing only fails for unsupported key types, which the hash join
+        // has already hashed. Then the shards miss these keys, so drop the
+        // whole bloom filter.
+        let buckets = ShardedHashes::try_new(&keys, num_shards);
+        let mut guard = self.inner.lock();
+        let CompletionState::Bloom(phase) = &mut guard.completion else {
+            unreachable!("the bloom phase ends after its last shard");
+        };
+        match buckets {
+            Ok(buckets) => phase.buckets.push(Arc::new(buckets)),
+            Err(_) => phase.num_shards = 0,
+        }
+        phase.remaining_buckets -= 1;
+        if phase.remaining_buckets == 0 {
+            phase.exchanged = Some(datafusion_common::instant::Instant::now());
+            if phase.num_shards == 0 {
+                phase.remaining_shards = 0;
+                let finalize = self.take_bloom_phase(&mut guard);
+                drop(guard);
+                return self.finish_bloom_phase(finalize);
+            }
+            drop(guard);
+            self.completion_notify.notify_waiters();
+        }
+    }
+
+    /// Fills one shard that no task has taken. The task that stores the last
+    /// shard builds the global filter.
+    fn fill_shard(&self) {
+        let (shard, buckets, bytes, num_shards) = {
             let mut guard = self.inner.lock();
             let CompletionState::Bloom(phase) = &mut guard.completion else {
-                unreachable!("the bloom phase ends after its last filter");
+                return;
             };
-            if let PartitionStatus::Reported(data) = &mut phase.partitions[partition_id] {
-                data.build_keys.bloom_filter = filter;
-            }
-            phase.remaining -= 1;
-            if phase.remaining > 0 {
+            if phase.remaining_buckets > 0 || phase.next_shard >= phase.num_shards {
                 return;
             }
-            let CompletionState::Bloom(phase) =
-                std::mem::replace(&mut guard.completion, CompletionState::Finalizing)
-            else {
-                unreachable!()
-            };
-            (phase.partitions, phase.started, phase.bytes)
+            phase.next_shard += 1;
+            (
+                phase.next_shard - 1,
+                phase.buckets.clone(),
+                phase.bytes,
+                phase.num_shards,
+            )
         };
-        let (partitions, started, bytes) = finalize_input;
+        let filter = shard_filter(&buckets, shard, bytes / num_shards);
+        let mut guard = self.inner.lock();
+        let CompletionState::Bloom(phase) = &mut guard.completion else {
+            unreachable!("the bloom phase ends after its last shard");
+        };
+        phase.shards[shard] = Some(filter);
+        phase.remaining_shards -= 1;
+        if phase.remaining_shards == 0 {
+            let finalize = self.take_bloom_phase(&mut guard);
+            drop(guard);
+            self.finish_bloom_phase(finalize);
+        }
+    }
+
+    fn take_bloom_phase(&self, guard: &mut AccumulatorState) -> BloomPhase {
+        let CompletionState::Bloom(phase) =
+            std::mem::replace(&mut guard.completion, CompletionState::Finalizing)
+        else {
+            unreachable!("only called in the bloom phase")
+        };
+        phase
+    }
+
+    /// Concatenates the shards into the global filter and builds the dynamic
+    /// filter with it.
+    fn finish_bloom_phase(&self, phase: BloomPhase) {
+        let BloomPhase {
+            mut partitions,
+            shards,
+            started,
+            exchanged,
+            bytes,
+            ..
+        } = phase;
         let fill = started.elapsed();
+        let filter = shards
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .filter(|s| !s.is_empty())
+            .map(|shards| {
+                let mut bitset = Vec::with_capacity(bytes);
+                for shard in &shards {
+                    shard
+                        .write_bitset(&mut bitset)
+                        .expect("writing to a Vec cannot fail");
+                }
+                Arc::new(Sbbf::new(&bitset))
+            });
+        // Every non-empty partition carries the same global filter, which the
+        // merge ORs only once.
+        for partition in &mut partitions {
+            if let PartitionStatus::Reported(data) = partition
+                && !matches!(data.pushdown, PushdownStrategy::Empty)
+            {
+                data.build_keys.bloom_filter.clone_from(&filter);
+            }
+        }
         self.finish(FinalizeInput::Partitioned(partitions));
         // Prototype instrumentation for the benchmarks
         if std::env::var_os("DF_BLOOM_TRACE").is_some() {
+            let exchange = exchanged.map_or(0.0, |e| (e - started).as_secs_f64() * 1e3);
             eprintln!(
-                "bloom_phase fill_ms={:.3} total_ms={:.3} bytes={bytes}",
+                "bloom_phase exchange_ms={exchange:.3} fill_ms={:.3} total_ms={:.3} bytes={bytes}",
                 fill.as_secs_f64() * 1e3,
                 started.elapsed().as_secs_f64() * 1e3,
             );
@@ -704,7 +819,7 @@ impl SharedBuildAccumulator {
     pub(crate) fn report_canceled_partition(&self, partition_id: usize) {
         // A partition that reported and is dropped in the bloom phase still
         // owes its filter. Its keys are here, so fill it now.
-        self.fill_bloom_filter(partition_id);
+        self.bucket_hashes(partition_id);
         let finalize_input = {
             let mut guard = self.inner.lock();
             self.store_canceled_partition(&mut guard, partition_id);
@@ -841,11 +956,12 @@ impl SharedBuildAccumulator {
                     CompletionState::Ready(Err(err)) => {
                         return Err(DataFusionError::Shared(Arc::clone(err)));
                     }
-                    CompletionState::Bloom(phase)
-                        if partition_id.is_some_and(|id| phase.owed[id]) =>
-                    {
+                    CompletionState::Bloom(phase) if phase.has_work(partition_id) => {
                         drop(guard);
-                        self.fill_bloom_filter(partition_id.unwrap_or_default());
+                        if let Some(id) = partition_id {
+                            self.bucket_hashes(id);
+                        }
+                        self.fill_shard();
                         continue;
                     }
                     CompletionState::Pending
