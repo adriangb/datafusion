@@ -124,6 +124,35 @@ pub(crate) fn partition_filter(
     Ok(Some(filter))
 }
 
+/// Bytes of the global filter for `num_distinct` keys of all partitions, at
+/// most `max_share` of `build_mem_used`. `None` when the filter at
+/// `options.fpp` is larger than `options.max_bytes`.
+pub(crate) fn global_filter_bytes(
+    num_distinct: usize,
+    build_mem_used: usize,
+    max_share: f64,
+    options: BloomFilterOptions,
+) -> Option<usize> {
+    let bytes = options.bytes(num_distinct)?;
+    let bytes = bytes.max(32).next_power_of_two();
+    let cap = ((build_mem_used as f64 * max_share) as usize).max(32);
+    // `Sbbf::new_with_num_of_bytes` rounds up to a power of two, so round the
+    // cap down to stay below it.
+    let cap = 1usize << cap.ilog2();
+    Some(bytes.min(cap))
+}
+
+/// The bloom filter of `keys` with `bytes` bytes (a power of two). Every
+/// partition uses the same size, so that the filters can be ORed.
+pub(crate) fn filter_with_bytes(keys: &[ArrayRef], bytes: usize) -> Result<Sbbf> {
+    let mut filter = Sbbf::new_with_num_of_bytes(bytes);
+    for_each_hash_batch(keys, |hashes| {
+        filter.insert_hashes(hashes);
+        Ok(())
+    })?;
+    Ok(filter)
+}
+
 /// The bloom filter of a [`BloomFilterExpr`] and the reservation for its
 /// memory, which is released when the filter is dropped.
 struct Filter {
@@ -218,6 +247,14 @@ impl BloomFilterExpr {
     /// Without a filter it only carries the pruning bitmap.
     pub fn has_filter(&self) -> bool {
         self.filter.is_some()
+    }
+
+    /// The estimated false positive probability of the filter, and its
+    /// size in bytes. `None` without a filter.
+    pub fn estimated_fpp_and_bytes(&self) -> Option<(f64, usize)> {
+        self.filter
+            .as_ref()
+            .map(|f| (f.filter.estimated_fpp(), f.filter.num_blocks() * 32))
     }
 
     /// Which parts of the build side's key range hold keys, for container pruning.

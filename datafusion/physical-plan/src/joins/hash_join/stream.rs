@@ -642,6 +642,7 @@ impl HashJoinStream {
             keys: left_data.values().to_vec(),
             bloom_filter: left_data.bloom_filter().cloned(),
             num_distinct: left_data.map().num_of_distinct_key(),
+            build_mem_used: left_data.build_mem_used(),
         };
 
         let build_data = match self.mode {

@@ -282,6 +282,11 @@ impl JoinLeftData {
         self.build.bloom_filter.as_ref()
     }
 
+    /// Bytes reserved for this build side
+    pub(super) fn build_mem_used(&self) -> usize {
+        self.build.reservation.size()
+    }
+
     /// Borrow bounds without sharing a consuming join's dynamic-filter state.
     pub(super) fn bounds(&self) -> Option<&PartitionBounds> {
         self.build.bounds.as_ref()
@@ -3390,7 +3395,11 @@ fn build_in_memory(
     // so the finalizing task only ORs the partition filters. Partitions hold
     // disjoint keys of similar counts, so the filter is sized for the keys of
     // all partitions estimated from this one.
+    // With several build partitions, the coordinator chooses one size for
+    // all partition filters once every partition has reported, and the
+    // partitions fill them then (see `BloomPhase`).
     let bloom_filter = if !should_compute_dynamic_filters
+        || num_build_partitions > 1
         || matches!(membership, PushdownStrategy::Empty)
         || left_values.is_empty()
     {

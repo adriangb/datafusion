@@ -12,7 +12,9 @@ use std::sync::Arc;
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 use crate::joins::PartitionMode;
-use crate::joins::hash_join::bloom_filter::{BloomFilterExpr, BloomFilterOptions};
+use crate::joins::hash_join::bloom_filter::{
+    BloomFilterExpr, BloomFilterOptions, filter_with_bytes, global_filter_bytes,
+};
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::not_in::NotIn;
 use crate::joins::key_range_bitmap::{KeyRangeBitmap, KeyRangePart};
@@ -24,7 +26,9 @@ use datafusion_common::{
     DataFusionError, NullEquality, Result, ScalarValue, SharedResult,
     assert_or_internal_err,
 };
-use datafusion_execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion_execution::memory_pool::{
+    MemoryConsumer, MemoryPool, MemoryReservation, UnboundedMemoryPool,
+};
 use datafusion_expr::Operator;
 use datafusion_functions::core::r#struct as struct_func;
 use datafusion_physical_expr::expressions::{
@@ -133,7 +137,14 @@ pub(crate) struct BuildKeys {
     pub(crate) bloom_filter: Option<Arc<Sbbf>>,
     /// Number of distinct key tuples
     pub(crate) num_distinct: usize,
+    /// Memory of the partition's build side (`build_mem_used`), which caps
+    /// the size of the global bloom filter
+    pub(crate) build_mem_used: usize,
 }
+
+/// The global bloom filter takes at most this share of the memory of the
+/// build side.
+const BLOOM_FILTER_MAX_MEMORY_SHARE: f64 = 0.1;
 
 /// Options for the global dynamic filter of a hash join, from the session
 /// configuration.
@@ -394,8 +405,34 @@ enum AccumulatedBuildData {
 
 enum CompletionState {
     Pending,
+    /// Every partition has reported. Each partition now fills its bloom
+    /// filter at the size that the coordinator chose from the keys of all
+    /// partitions.
+    Bloom(BloomPhase),
     Finalizing,
     Ready(SharedResult<()>),
+}
+
+/// The second barrier of a partitioned join with a bloom filter.
+///
+/// ```text
+/// build ─ report ─┐                ┌─ fill filter ─┐
+///                 ├─ choose size ──┤               ├─ OR, fold ─ probe
+/// build ─ report ─┘                └─ fill filter ─┘
+/// ```
+///
+/// The size comes from the distinct keys of all partitions, so a partition
+/// with few keys does not shrink the filter of the others.
+struct BloomPhase {
+    partitions: Vec<PartitionStatus>,
+    bytes: usize,
+    /// `owed[i]` is `true` while partition `i` has not started its filter
+    owed: Vec<bool>,
+    /// Filters not yet stored in `partitions`
+    remaining: usize,
+    /// Memory of the partition filters, released once they are ORed
+    _reservation: MemoryReservation,
+    started: datafusion_common::instant::Instant,
 }
 
 struct AccumulatorState {
@@ -515,6 +552,10 @@ impl SharedBuildAccumulator {
     /// # Returns
     /// * `Result<()>` - Ok if successful, Err if filter update failed or mode mismatch
     pub(crate) async fn report_build_data(&self, data: PartitionBuildData) -> Result<()> {
+        let partition_id = match &data {
+            PartitionBuildData::Partitioned { partition_id, .. } => Some(*partition_id),
+            PartitionBuildData::CollectLeft { .. } => None,
+        };
         let finalize_input = {
             let mut guard = self.inner.lock();
             self.store_build_data(&mut guard, data)?;
@@ -522,13 +563,148 @@ impl SharedBuildAccumulator {
         };
 
         if let Some(finalize_input) = finalize_input {
-            self.finish(finalize_input);
+            self.finish_or_start_bloom(finalize_input);
         }
 
-        self.wait_for_completion().await
+        self.wait_for_completion(partition_id).await
+    }
+
+    /// Builds the filter, or starts the bloom phase when the filter needs
+    /// bloom filters that the partitions have not built.
+    fn finish_or_start_bloom(&self, finalize_input: FinalizeInput) {
+        let FinalizeInput::Partitioned(partitions) = finalize_input else {
+            return self.finish(finalize_input);
+        };
+        let Some(bytes) = self.bloom_filter_bytes(&partitions) else {
+            return self.finish(FinalizeInput::Partitioned(partitions));
+        };
+        let owed: Vec<bool> = partitions
+            .iter()
+            .map(|p| {
+                matches!(p, PartitionStatus::Reported(d)
+                    if !matches!(d.pushdown, PushdownStrategy::Empty))
+            })
+            .collect();
+        let remaining = owed.iter().filter(|o| **o).count();
+        let pool = self
+            .global_filter_options
+            .memory_pool
+            .clone()
+            .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
+        let reservation =
+            MemoryConsumer::new("HashJoinBloomFilterPartitions").register(&pool);
+        if reservation.try_grow(remaining * bytes).is_err() {
+            return self.finish(FinalizeInput::Partitioned(partitions));
+        }
+        let mut guard = self.inner.lock();
+        guard.completion = CompletionState::Bloom(BloomPhase {
+            partitions,
+            bytes,
+            owed,
+            remaining,
+            _reservation: reservation,
+            started: datafusion_common::instant::Instant::now(),
+        });
+        drop(guard);
+        self.completion_notify.notify_waiters();
+    }
+
+    /// The size of the bloom filter of every partition, or `None` when the
+    /// global filter needs no bloom filter that is not built yet.
+    fn bloom_filter_bytes(&self, partitions: &[PartitionStatus]) -> Option<usize> {
+        let mut non_empty = Vec::with_capacity(partitions.len());
+        for partition in partitions {
+            match partition {
+                PartitionStatus::Reported(d) => {
+                    if !matches!(d.pushdown, PushdownStrategy::Empty) {
+                        non_empty.push(d)
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if non_empty.is_empty()
+            || non_empty
+                .iter()
+                .all(|p| p.build_keys.bloom_filter.is_some())
+            || non_empty.iter().any(|p| p.build_keys.keys.is_empty())
+        {
+            return None;
+        }
+        let num_distinct: usize =
+            non_empty.iter().map(|p| p.build_keys.num_distinct).sum();
+        let all_in_lists = non_empty
+            .iter()
+            .all(|p| matches!(p.pushdown, PushdownStrategy::InList(_)));
+        if all_in_lists
+            && num_distinct <= self.global_filter_options.inlist_max_distinct_values
+        {
+            return None;
+        }
+        let build_mem_used = non_empty.iter().map(|p| p.build_keys.build_mem_used).sum();
+        global_filter_bytes(
+            num_distinct,
+            build_mem_used,
+            BLOOM_FILTER_MAX_MEMORY_SHARE,
+            self.global_filter_options.bloom_filter,
+        )
+    }
+
+    /// Fills the bloom filter of `partition_id` when the bloom phase still
+    /// needs it. The partition that stores the last filter builds the global
+    /// filter.
+    fn fill_bloom_filter(&self, partition_id: usize) {
+        let (keys, bytes) = {
+            let mut guard = self.inner.lock();
+            let CompletionState::Bloom(phase) = &mut guard.completion else {
+                return;
+            };
+            if !std::mem::take(&mut phase.owed[partition_id]) {
+                return;
+            }
+            let PartitionStatus::Reported(data) = &phase.partitions[partition_id] else {
+                unreachable!("only reported partitions owe a bloom filter");
+            };
+            (data.build_keys.keys.clone(), phase.bytes)
+        };
+        // Without this filter (an error), the global filter has no bloom filter
+        let filter = filter_with_bytes(&keys, bytes).ok().map(Arc::new);
+        let finalize_input = {
+            let mut guard = self.inner.lock();
+            let CompletionState::Bloom(phase) = &mut guard.completion else {
+                unreachable!("the bloom phase ends after its last filter");
+            };
+            if let PartitionStatus::Reported(data) = &mut phase.partitions[partition_id] {
+                data.build_keys.bloom_filter = filter;
+            }
+            phase.remaining -= 1;
+            if phase.remaining > 0 {
+                return;
+            }
+            let CompletionState::Bloom(phase) =
+                std::mem::replace(&mut guard.completion, CompletionState::Finalizing)
+            else {
+                unreachable!()
+            };
+            (phase.partitions, phase.started, phase.bytes)
+        };
+        let (partitions, started, bytes) = finalize_input;
+        let fill = started.elapsed();
+        self.finish(FinalizeInput::Partitioned(partitions));
+        // Prototype instrumentation for the benchmarks
+        if std::env::var_os("DF_BLOOM_TRACE").is_some() {
+            eprintln!(
+                "bloom_phase fill_ms={:.3} total_ms={:.3} bytes={bytes}",
+                fill.as_secs_f64() * 1e3,
+                started.elapsed().as_secs_f64() * 1e3,
+            );
+        }
     }
 
     pub(crate) fn report_canceled_partition(&self, partition_id: usize) {
+        // A partition that reported and is dropped in the bloom phase still
+        // owes its filter. Its keys are here, so fill it now.
+        self.fill_bloom_filter(partition_id);
         let finalize_input = {
             let mut guard = self.inner.lock();
             self.store_canceled_partition(&mut guard, partition_id);
@@ -536,7 +712,7 @@ impl SharedBuildAccumulator {
         };
 
         if let Some(finalize_input) = finalize_input {
-            self.finish(finalize_input);
+            self.finish_or_start_bloom(finalize_input);
         }
     }
 
@@ -656,7 +832,7 @@ impl SharedBuildAccumulator {
         self.completion_notify.notify_waiters();
     }
 
-    async fn wait_for_completion(&self) -> Result<()> {
+    async fn wait_for_completion(&self, partition_id: Option<usize>) -> Result<()> {
         loop {
             let notified = {
                 let guard = self.inner.lock();
@@ -665,9 +841,16 @@ impl SharedBuildAccumulator {
                     CompletionState::Ready(Err(err)) => {
                         return Err(DataFusionError::Shared(Arc::clone(err)));
                     }
-                    CompletionState::Pending | CompletionState::Finalizing => {
-                        self.completion_notify.notified()
+                    CompletionState::Bloom(phase)
+                        if partition_id.is_some_and(|id| phase.owed[id]) =>
+                    {
+                        drop(guard);
+                        self.fill_bloom_filter(partition_id.unwrap_or_default());
+                        continue;
                     }
+                    CompletionState::Pending
+                    | CompletionState::Bloom(_)
+                    | CompletionState::Finalizing => self.completion_notify.notified(),
                 }
             };
             notified.await;
@@ -967,7 +1150,7 @@ mod tests {
     /// Adds the bloom filter of `build_keys.keys`, sized for 4 times its
     /// keys (the keys of a few partitions).
     fn test_build_keys(mut build_keys: BuildKeys) -> BuildKeys {
-        let reservation = datafusion_execution::memory_pool::MemoryConsumer::new("test")
+        let reservation = MemoryConsumer::new("test")
             .register(&(Arc::new(UnboundedMemoryPool::default()) as Arc<dyn MemoryPool>));
         build_keys.bloom_filter =
             crate::joins::hash_join::bloom_filter::partition_filter(
@@ -1148,6 +1331,7 @@ mod tests {
             bounds: bounds(min, max),
             keys_have_null: false,
             build_keys: test_build_keys(BuildKeys {
+                build_mem_used: 0,
                 bloom_filter: None,
                 keys: vec![Arc::new(Int32Array::from(keys))],
                 num_distinct,
@@ -1216,6 +1400,7 @@ mod tests {
                 bounds: bounds(*keys.iter().min().unwrap(), *keys.iter().max().unwrap()),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
+                    build_mem_used: 0,
                     bloom_filter: None,
                     num_distinct: keys.len(),
                     keys: vec![Arc::new(Int32Array::from(keys))],
@@ -1259,6 +1444,7 @@ mod tests {
                 bounds: bounds(*rows.iter().min().unwrap(), *rows.iter().max().unwrap()),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
+                    build_mem_used: 0,
                     bloom_filter: None,
                     num_distinct,
                     keys: vec![Arc::new(Int32Array::from(rows))],
@@ -1355,6 +1541,7 @@ mod tests {
                 bounds: no_bounds(),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
+                    build_mem_used: 0,
                     bloom_filter: None,
                     num_distinct: keys.len(),
                     keys: vec![Arc::new(Float64Array::from(keys))],
@@ -1435,6 +1622,88 @@ mod tests {
         assert!(may(50, 60));
         assert!(may(1_000_050, 1_000_060));
         assert!(!may(400_000, 600_000));
+    }
+
+    /// Reports `keys` for each partition at the same time, without partition
+    /// bloom filters (as a partitioned join with several partitions does),
+    /// and returns the bloom filter of the global filter.
+    async fn report_concurrently(
+        partitions: Vec<Vec<i32>>,
+    ) -> (SharedBuildAccumulator, Option<(f64, usize)>) {
+        let acc = Arc::new(make_partitioned_expr_accumulator_for_test(partitions.len()));
+        let tasks: Vec<_> = partitions
+            .into_iter()
+            .enumerate()
+            .map(|(partition_id, keys)| {
+                let acc = Arc::clone(&acc);
+                datafusion_common_runtime::SpawnedTask::spawn(async move {
+                    let (min, max) =
+                        (*keys.iter().min().unwrap(), *keys.iter().max().unwrap());
+                    acc.report_build_data(PartitionBuildData::Partitioned {
+                        partition_id,
+                        pushdown: PushdownStrategy::Large(None),
+                        bounds: bounds(min, max),
+                        keys_have_null: false,
+                        build_keys: BuildKeys {
+                            num_distinct: keys.len(),
+                            keys: vec![Arc::new(Int32Array::from(keys))],
+                            bloom_filter: None,
+                            build_mem_used: 1 << 30,
+                        },
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.join().await.unwrap().unwrap();
+        }
+        let acc = Arc::into_inner(acc).unwrap();
+        let expr = current_expr(&acc);
+        let fpp = binary_expr(&expr)
+            .right()
+            .downcast_ref::<BloomFilterExpr>()
+            .expect("expected a bloom filter")
+            .estimated_fpp_and_bytes();
+        (acc, fpp)
+    }
+
+    /// One partition with 1% of the keys does not shrink the global filter:
+    /// the filter is sized for the keys of all partitions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn skewed_partitions_keep_target_fpp() {
+        let small = (0..1_000).collect::<Vec<i32>>();
+        let mut partitions = vec![small];
+        for p in 1..4 {
+            partitions.push((p * 100_000..p * 100_000 + 33_000).collect());
+        }
+        let all_keys: Vec<i32> = partitions.iter().flatten().copied().collect();
+        let (acc, fpp) = report_concurrently(partitions).await;
+        let (fpp, bytes) = fpp.expect("expected a bloom filter");
+        let target = GlobalFilterOptions::default().bloom_filter.fpp;
+        assert!(fpp <= target * 1.5, "estimated fpp {fpp}, {bytes} bytes");
+
+        let expr = current_expr(&acc);
+        assert!(eval_bool(&expr, all_keys).into_iter().all(|pass| pass));
+        // Keys inside the bounds but not on the build side
+        let others: Vec<i32> = (40_000..90_000).collect();
+        let passed = eval_bool(&expr, others.clone())
+            .into_iter()
+            .filter(|p| *p)
+            .count();
+        let measured = passed as f64 / others.len() as f64;
+        assert!(measured <= target * 2.0, "measured fpp {measured}");
+    }
+
+    /// Partitions of equal size get the same filter as one filter of all keys.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn balanced_partitions_fill_one_global_filter() {
+        let partitions: Vec<Vec<i32>> = (0..4)
+            .map(|p| (p * 10_000..p * 10_000 + 5_000).collect())
+            .collect();
+        let (_, fpp) = report_concurrently(partitions).await;
+        let (fpp, _) = fpp.expect("expected a bloom filter");
+        assert!(fpp <= 0.015, "estimated fpp {fpp}");
     }
 
     #[test]
