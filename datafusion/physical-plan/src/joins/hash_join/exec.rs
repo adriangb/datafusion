@@ -3231,6 +3231,9 @@ fn build_in_memory(
     };
     let left_values = evaluate_expressions_to_arrays(on_left, &batch)?;
 
+    // The hashes of the build keys, kept for the bloom filter so that it does
+    // not hash the keys again. Only the hash map computes them.
+    let mut build_hashes: Option<Vec<u64>> = None;
     let join_hash_map = if let Some((min_val, max_val)) = array_map_key_range(
         bounds.as_ref(),
         &left_values,
@@ -3274,6 +3277,10 @@ fn build_in_memory(
         let mut hashes_buffer = Vec::with_capacity(chunk_rows);
         // `chunk_rows` is 0 when the build side is empty
         let chunk_rows = chunk_rows.max(1);
+        // The bloom filter uses the hash join hashes, the same as the map's
+        // (`random_state` is always `HASH_JOIN_SEED`).
+        let mut kept_hashes =
+            should_compute_dynamic_filters.then(|| vec![0u64; num_rows]);
 
         // Update the hashmap from slices of the key arrays `left_values` of at
         // most `chunk_rows` rows, starting from the last one, so rows with
@@ -3297,7 +3304,11 @@ fn build_in_memory(
                 true,
                 null_equality,
             )?;
+            if let Some(kept) = &mut kept_hashes {
+                kept[offset..offset + len].copy_from_slice(&hashes_buffer);
+            }
         }
+        build_hashes = kept_hashes;
 
         Map::HashMap(hashmap)
     };
@@ -3426,6 +3437,7 @@ fn build_in_memory(
     } else {
         let filter = bloom_filter::partition_filter(
             &left_values,
+            build_hashes.as_deref(),
             map.num_of_distinct_key()
                 .saturating_mul(num_build_partitions),
             GlobalFilterOptions::new(config).bloom_filter,

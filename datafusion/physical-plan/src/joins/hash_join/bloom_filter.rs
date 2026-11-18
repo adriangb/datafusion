@@ -100,8 +100,12 @@ fn valid_rows(keys: &[ArrayRef]) -> Option<NullBuffer> {
 ///
 /// The filter memory is charged to `reservation`. `None` also when it cannot
 /// grow.
+///
+/// `hashes` are the hash join hashes of every row of `keys`, when the caller
+/// has them. Without them the keys are hashed here.
 pub(crate) fn partition_filter(
     keys: &[ArrayRef],
+    hashes: Option<&[u64]>,
     num_distinct: usize,
     options: BloomFilterOptions,
     reservation: &MemoryReservation,
@@ -117,12 +121,26 @@ pub(crate) fn partition_filter(
         return Ok(None);
     }
     let mut filter = Sbbf::new_with_num_of_bytes(bytes);
-    for_each_hash_batch(keys, |hashes| {
-        for &hash in hashes {
-            filter.insert_hash(hash);
-        }
-        Ok(())
-    })?;
+    match hashes {
+        Some(hashes) => match valid_rows(keys) {
+            Some(valid) => {
+                for i in valid.valid_indices() {
+                    filter.insert_hash(hashes[i]);
+                }
+            }
+            None => {
+                for &hash in hashes {
+                    filter.insert_hash(hash);
+                }
+            }
+        },
+        None => for_each_hash_batch(keys, |hashes| {
+            for &hash in hashes {
+                filter.insert_hash(hash);
+            }
+            Ok(())
+        })?,
+    }
     Ok(Some(filter))
 }
 
@@ -401,7 +419,7 @@ mod tests {
         options: BloomFilterOptions,
     ) -> Option<Sbbf> {
         let reservation = MemoryConsumer::new("test").register(&unbounded());
-        partition_filter(keys, num_distinct, options, &reservation).unwrap()
+        partition_filter(keys, None, num_distinct, options, &reservation).unwrap()
     }
 
     fn expr_with(
@@ -564,6 +582,29 @@ mod tests {
         assert_eq!(expr.to_string(), "key_range_pruning");
         let batch = int_batch(vec![Some(-1)]);
         assert_eq!(eval(&expr, &batch), vec![true]);
+    }
+
+    /// A filter filled from the caller's hashes equals the filter filled
+    /// from the keys, and skips rows with a NULL key.
+    #[test]
+    fn filter_from_hashes_matches_filter_from_keys() {
+        let keys: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(
+            (0..20_000)
+                .map(|k| (k % 7 != 0).then_some(k * 3))
+                .collect::<Vec<_>>(),
+        ))];
+        let mut hashes = vec![0; 20_000];
+        create_hashes(&keys, HASH_JOIN_SEED.random_state(), &mut hashes).unwrap();
+        let reservation = MemoryConsumer::new("test").register(&unbounded());
+        let filter = |hashes| {
+            let filter = partition_filter(&keys, hashes, 20_000, OPTIONS, &reservation)
+                .unwrap()
+                .unwrap();
+            let mut bits = vec![];
+            filter.write_bitset(&mut bits).unwrap();
+            bits
+        };
+        assert_eq!(filter(Some(&hashes)), filter(None));
     }
 
     /// The filter memory is charged to the pool and released on drop.

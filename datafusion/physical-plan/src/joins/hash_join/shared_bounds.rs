@@ -988,6 +988,7 @@ mod tests {
         build_keys.bloom_filter =
             crate::joins::hash_join::bloom_filter::partition_filter(
                 &build_keys.keys,
+                None,
                 build_keys.num_distinct * 4,
                 GlobalFilterOptions::default().bloom_filter,
                 &reservation,
