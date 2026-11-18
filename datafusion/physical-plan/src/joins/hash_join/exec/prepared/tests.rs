@@ -772,9 +772,13 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
             assert_eq!(counter.count_batch(&membership_batch), 0);
             drop(membership_batch);
 
+            // The IN-list build expects the global InList, so it has no bloom
+            // filter.
+            assert!(prepared.build.bloom_filter.is_none());
+
             // Disabling IN-list membership shares the same key buffers; a
-            // pruning bitmap, when the sparse two-key range earns one, adds
-            // its own bytes on top.
+            // pruning bitmap, when the sparse two-key range earns one, and
+            // the bloom filter add their own bytes on top.
             let mut config = ConfigOptions::default();
             config.optimizer.hash_join_inlist_pushdown_max_size = 0;
             let map = base
@@ -787,7 +791,12 @@ async fn prepared_inlist_shares_accounted_build_buffers() -> Result<()> {
             let PushdownStrategy::Large(bitmap) = &map.build.membership else {
                 panic!("expected large membership");
             };
-            let bitmap_bytes = bitmap.as_ref().map_or(0, |bitmap| bitmap.size());
+            let bitmap_bytes = bitmap.as_ref().map_or(0, |bitmap| bitmap.size())
+                + map
+                    .build
+                    .bloom_filter
+                    .as_ref()
+                    .map_or(0, |filter| filter.num_blocks() * 32);
             assert_eq!(map.reserved_bytes(), bytes + bitmap_bytes);
             assert_eq!(pool.reserved(), 2 * bytes + bitmap_bytes);
             drop(map);

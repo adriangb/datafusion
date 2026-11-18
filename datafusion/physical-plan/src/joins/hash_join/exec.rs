@@ -3418,9 +3418,20 @@ fn build_in_memory(
     // so the finalizing task only ORs the partition filters. Partitions hold
     // disjoint keys of similar counts, so the filter is sized for the keys of
     // all partitions estimated from this one.
+    let global_options = GlobalFilterOptions::new(config);
+    // The global filter uses an InList when every partition has one and they
+    // hold at most `inlist_max_distinct_values` keys together. Partitions
+    // hold disjoint keys of similar counts, so this partition estimates that
+    // total, and skips a bloom filter that the InList would replace.
+    let inlist_expected = matches!(membership, PushdownStrategy::InList(_))
+        && map
+            .num_of_distinct_key()
+            .saturating_mul(num_build_partitions)
+            <= global_options.inlist_max_distinct_values;
     let bloom_filter = if !should_compute_dynamic_filters
         || matches!(membership, PushdownStrategy::Empty)
         || left_values.is_empty()
+        || inlist_expected
     {
         None
     } else {
@@ -3428,7 +3439,7 @@ fn build_in_memory(
             &left_values,
             map.num_of_distinct_key()
                 .saturating_mul(num_build_partitions),
-            GlobalFilterOptions::new(config).bloom_filter,
+            global_options.bloom_filter,
             &reservation,
         )?;
         if let Some(filter) = &filter {
