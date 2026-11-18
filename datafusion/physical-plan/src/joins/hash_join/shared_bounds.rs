@@ -31,7 +31,6 @@ use datafusion_physical_expr::expressions::{
     BinaryExpr, DynamicFilterPhysicalExpr, InListExpr, IsNullExpr, lit,
 };
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr};
-use parquet::bloom_filter::Sbbf;
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -128,9 +127,6 @@ impl PartitionBounds {
 pub(crate) struct BuildKeys {
     /// One array per join key
     pub(crate) keys: Vec<ArrayRef>,
-    /// Bloom filter of the keys. `None` when this partition has no filter,
-    /// then the global filter has no bloom filter.
-    pub(crate) bloom_filter: Option<Arc<Sbbf>>,
     /// Number of distinct key tuples
     pub(crate) num_distinct: usize,
 }
@@ -802,25 +798,23 @@ impl SharedBuildAccumulator {
             _ => {
                 let pruning_bitmap =
                     self.merge_pruning_bitmaps(&non_empty, bounds.as_ref());
-                // Every partition must have its filter. A partition has none
-                // when the build side is too big for a bloom filter, or its
-                // memory reservation failed.
-                let filters = non_empty
+                let keys: Vec<&[ArrayRef]> = non_empty
                     .iter()
-                    .map(|p| p.build_keys.bloom_filter.as_deref())
-                    .collect::<Option<Vec<_>>>();
+                    .map(|p| p.build_keys.keys.as_slice())
+                    .collect();
                 let pool = self
                     .global_filter_options
                     .memory_pool
                     .clone()
                     .unwrap_or_else(|| Arc::new(UnboundedMemoryPool::default()));
-                let bloom = BloomFilterExpr::try_new(
+                let bloom = BloomFilterExpr::lazy(
                     self.on_right.clone(),
-                    filters.as_deref(),
+                    &keys,
+                    num_distinct,
                     self.global_filter_options.bloom_filter,
-                    &pool,
+                    pool,
                     pruning_bitmap,
-                )?;
+                );
                 // Without a bloom filter, keep the expression only for its
                 // pruning bitmap
                 (bloom.has_filter() || bloom.pruning_bitmap().is_some())
@@ -980,20 +974,10 @@ mod tests {
     use super::*;
     use crate::joins::hash_join::not_in::{NotInOutput, NotInScope};
 
-    /// Adds the bloom filter of `build_keys.keys`, sized for 4 times its
-    /// keys (the keys of a few partitions).
-    fn test_build_keys(mut build_keys: BuildKeys) -> BuildKeys {
-        let reservation = datafusion_execution::memory_pool::MemoryConsumer::new("test")
-            .register(&(Arc::new(UnboundedMemoryPool::default()) as Arc<dyn MemoryPool>));
-        build_keys.bloom_filter =
-            crate::joins::hash_join::bloom_filter::partition_filter(
-                &build_keys.keys,
-                build_keys.num_distinct * 4,
-                GlobalFilterOptions::default().bloom_filter,
-                &reservation,
-            )
-            .unwrap()
-            .map(Arc::new);
+    /// The bloom filter holds weak references to the build keys, which the
+    /// join's build data owns. Tests have no join, so they leak a reference.
+    fn test_build_keys(build_keys: BuildKeys) -> BuildKeys {
+        Box::leak(Box::new(build_keys.keys.clone()));
         build_keys
     }
 
@@ -1164,7 +1148,6 @@ mod tests {
             bounds: bounds(min, max),
             keys_have_null: false,
             build_keys: test_build_keys(BuildKeys {
-                bloom_filter: None,
                 keys: vec![Arc::new(Int32Array::from(keys))],
                 num_distinct,
             }),
@@ -1232,7 +1215,6 @@ mod tests {
                 bounds: bounds(*keys.iter().min().unwrap(), *keys.iter().max().unwrap()),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
-                    bloom_filter: None,
                     num_distinct: keys.len(),
                     keys: vec![Arc::new(Int32Array::from(keys))],
                 }),
@@ -1275,7 +1257,6 @@ mod tests {
                 bounds: bounds(*rows.iter().min().unwrap(), *rows.iter().max().unwrap()),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
-                    bloom_filter: None,
                     num_distinct,
                     keys: vec![Arc::new(Int32Array::from(rows))],
                 }),
@@ -1371,7 +1352,6 @@ mod tests {
                 bounds: no_bounds(),
                 keys_have_null: false,
                 build_keys: test_build_keys(BuildKeys {
-                    bloom_filter: None,
                     num_distinct: keys.len(),
                     keys: vec![Arc::new(Float64Array::from(keys))],
                 }),
@@ -1407,28 +1387,6 @@ mod tests {
             assert_eq!(pass, (0..=3997).contains(&k), "key {k}");
         }
         assert_eq!(pool.reserved(), 0);
-    }
-
-    /// A partition without hashes (too big alone, or its memory reservation
-    /// failed) means no bloom filter: the filter keeps only the bounds and the
-    /// pruning bitmap.
-    #[test]
-    fn partition_without_hashes_skips_bloom_filter() {
-        let acc = make_partitioned_expr_accumulator_for_test(2);
-        let mut no_hashes = reported_map((1_000_000..1_000_100).collect());
-        if let PartitionStatus::Reported(data) = &mut no_hashes {
-            data.build_keys.bloom_filter = None;
-        }
-        acc.build_filter(FinalizeInput::Partitioned(vec![
-            reported_map((0..100).collect()),
-            no_hashes,
-        ]))
-        .unwrap();
-        let expr = current_expr(&acc);
-        assert_eq!(
-            expr.to_string(),
-            "probe_key@0 >= 0 AND probe_key@0 <= 1000099 AND key_range_pruning"
-        );
     }
 
     /// The bloom filter carries one key-range bitmap for all partitions, so scans

@@ -5,22 +5,28 @@
 //! Bloom filter membership test over the build side keys of a hash join, for
 //! the join's dynamic filter.
 //!
-//! Each build partition inserts the hash join hashes of its keys into its own
-//! bloom filter ([`partition_filter`]), in its own build task. Once every
-//! partition is done, one task ORs the partition filters into one filter
-//! ([`Sbbf::union`]) and folds it to the target false positive probability.
-//! Folding and union commute, so this is the filter of all build keys.
+//! The join creates the expression from the keys of all build partitions
+//! ([`BloomFilterExpr::lazy`]). The expression fills its bloom filter with the
+//! hash join hashes of those keys on its first [`PhysicalExpr::evaluate`]. A
+//! consumer that only prunes containers (with the bounds and the pruning
+//! bitmap) never evaluates it, so the filter is never built.
+//!
+//! The expression holds only weak references to the build keys: the dynamic
+//! filter can outlive the join, and must not keep the build side in memory. A
+//! filter first evaluated after the join released its keys has no filter.
 
 use std::fmt::{self, Display};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
+#[cfg(test)]
+use datafusion_common::DataFusionError;
 use datafusion_common::hash_utils::create_hashes;
-use datafusion_common::{DataFusionError, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue};
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion_expr::ColumnarValue;
 use datafusion_expr_common::dyn_eq::DynHash;
@@ -53,6 +59,7 @@ impl BloomFilterOptions {
     }
 }
 
+#[cfg(test)]
 fn parquet_err(e: parquet::errors::ParquetError) -> DataFusionError {
     DataFusionError::External(Box::new(e))
 }
@@ -93,6 +100,7 @@ fn valid_rows(keys: &[ArrayRef]) -> Option<NullBuffer> {
     NullBuffer::union_many(nulls.iter().map(Option::as_ref))
 }
 
+#[cfg(test)]
 /// The bloom filter of the keys of one build partition, sized for
 /// `num_distinct` keys (the estimated number of distinct keys of all
 /// partitions, so that the partition filters can be ORed). `None` when that
@@ -133,6 +141,77 @@ struct Filter {
     _reservation: MemoryReservation,
 }
 
+/// The build keys that a lazy [`BloomFilterExpr`] fills its filter from.
+struct LazySource {
+    /// The key arrays of each build partition
+    partitions: Vec<Vec<Weak<dyn Array>>>,
+    /// Filter size, from the distinct key count of all partitions
+    bytes: usize,
+    options: BloomFilterOptions,
+    pool: Arc<dyn MemoryPool>,
+}
+
+impl LazySource {
+    /// The filter of all build keys. `None` when a partition released its
+    /// keys, `pool` cannot hold the filter, or the filter is saturated.
+    fn build(&self) -> Result<Option<Filter>> {
+        let Some(partitions) = self
+            .partitions
+            .iter()
+            .map(|keys| keys.iter().map(Weak::upgrade).collect::<Option<Vec<_>>>())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let reservation = MemoryConsumer::new("HashJoinBloomFilter").register(&self.pool);
+        // The size that `Sbbf::new_with_num_of_bytes` allocates
+        if reservation
+            .try_grow(self.bytes.max(32).next_power_of_two())
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let mut filter = Sbbf::new_with_num_of_bytes(self.bytes);
+        for keys in &partitions {
+            for_each_hash_batch(keys, |hashes| {
+                for &hash in hashes {
+                    filter.insert_hash(hash);
+                }
+                Ok(())
+            })?;
+        }
+        // A saturated filter costs CPU time and removes almost no rows
+        if filter.estimated_fpp() > self.options.max_fpp {
+            return Ok(None);
+        }
+        Ok(Some(Filter {
+            filter,
+            _reservation: reservation,
+        }))
+    }
+}
+
+/// A bloom filter that is built at most once, on first use.
+struct FilterCell {
+    filter: OnceLock<Option<Filter>>,
+    /// `None` for a filter built when the expression was created
+    source: Option<LazySource>,
+}
+
+impl FilterCell {
+    fn get(&self) -> Option<&Filter> {
+        self.filter
+            .get_or_init(|| {
+                // The filter is only an optimization: on an error, keep every row
+                self.source
+                    .as_ref()
+                    .and_then(|source| source.build().ok().flatten())
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(test)]
 /// ORs the filters of all build partitions and folds the result. Returns
 /// `None` (no bloom filter) when `pool` cannot hold the filter or it is
 /// saturated.
@@ -184,13 +263,14 @@ fn merge(
 pub struct BloomFilterExpr {
     /// Probe side join key expressions
     on_columns: Vec<PhysicalExprRef>,
-    /// `None` when no bloom filter was built
-    filter: Option<Arc<Filter>>,
+    /// `None` when there is no bloom filter
+    filter: Option<Arc<FilterCell>>,
     /// Which parts of the build side's key range hold keys, for container pruning
     pruning_bitmap: Option<Arc<KeyRangeBitmap>>,
 }
 
 impl BloomFilterExpr {
+    #[cfg(test)]
     /// ORs the bloom filters of every build partition ([`partition_filter`])
     /// into one filter, charged to `pool`.
     ///
@@ -206,7 +286,12 @@ impl BloomFilterExpr {
         pruning_bitmap: Option<Arc<KeyRangeBitmap>>,
     ) -> Result<Self> {
         let filter = match partitions {
-            Some(partitions) => merge(partitions, options, pool)?.map(Arc::new),
+            Some(partitions) => merge(partitions, options, pool)?.map(|filter| {
+                Arc::new(FilterCell {
+                    filter: OnceLock::from(Some(filter)),
+                    source: None,
+                })
+            }),
             None => None,
         };
         Ok(Self {
@@ -214,6 +299,41 @@ impl BloomFilterExpr {
             filter,
             pruning_bitmap,
         })
+    }
+
+    /// A bloom filter of the keys `partitions` (one entry per build partition,
+    /// one array per join key), filled on the first [`PhysicalExpr::evaluate`].
+    /// `num_distinct` is the distinct key count of all partitions.
+    ///
+    /// Without a filter (the filter for `num_distinct` keys is larger than
+    /// `options.max_bytes`), the expression only carries `pruning_bitmap`.
+    pub(crate) fn lazy(
+        on_columns: Vec<PhysicalExprRef>,
+        partitions: &[&[ArrayRef]],
+        num_distinct: usize,
+        options: BloomFilterOptions,
+        pool: Arc<dyn MemoryPool>,
+        pruning_bitmap: Option<Arc<KeyRangeBitmap>>,
+    ) -> Self {
+        let filter = options.bytes(num_distinct).map(|bytes| {
+            Arc::new(FilterCell {
+                filter: OnceLock::new(),
+                source: Some(LazySource {
+                    partitions: partitions
+                        .iter()
+                        .map(|keys| keys.iter().map(Arc::downgrade).collect())
+                        .collect(),
+                    bytes,
+                    options,
+                    pool,
+                }),
+            })
+        });
+        Self {
+            on_columns,
+            filter,
+            pruning_bitmap,
+        }
     }
 
     /// Returns `true` if the expression tests rows against a bloom filter.
@@ -232,6 +352,8 @@ impl BloomFilterExpr {
     pub(crate) fn filter_bytes(&self) -> usize {
         self.filter
             .as_ref()
+            .and_then(|cell| cell.filter.get())
+            .and_then(Option::as_ref)
             .map_or(0, |filter| filter.filter.num_blocks() * 32)
     }
 
@@ -308,7 +430,7 @@ impl PhysicalExpr for BloomFilterExpr {
     }
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
-        let Some(filter) = &self.filter else {
+        let Some(filter) = self.filter.as_ref().and_then(|cell| cell.get()) else {
             // No filter: only the pruning bitmap, which is not tested per row
             return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))));
         };
@@ -506,7 +628,7 @@ mod tests {
         expected.fold_to_target_fpp(OPTIONS.fpp);
         let (mut a, mut b) = (vec![], vec![]);
         expected.write_bitset(&mut a).unwrap();
-        let filter = &expr.filter.as_ref().unwrap().filter;
+        let filter = &expr.filter.as_ref().unwrap().get().unwrap().filter;
         filter.write_bitset(&mut b).unwrap();
         assert_eq!(a, b);
     }
@@ -566,12 +688,63 @@ mod tests {
         assert_eq!(eval(&expr, &batch), vec![true]);
     }
 
+    fn lazy_int_expr(keys: &[ArrayRef], pool: &Arc<dyn MemoryPool>) -> BloomFilterExpr {
+        let columns: Vec<PhysicalExprRef> = vec![Arc::new(Column::new("k", 0))];
+        BloomFilterExpr::lazy(
+            columns,
+            &[keys],
+            keys[0].len(),
+            OPTIONS,
+            Arc::clone(pool),
+            None,
+        )
+    }
+
+    /// A lazy filter takes no memory until its first evaluation, then holds
+    /// the filter of all build keys.
+    #[test]
+    fn lazy_filter_is_built_on_first_evaluation() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let keys = int_keys((0..10_000).map(|k| k * 2).collect());
+        let expr = lazy_int_expr(&keys, &pool);
+        assert!(expr.has_filter());
+        assert_eq!(expr.filter_bytes(), 0);
+        assert_eq!(pool.reserved(), 0);
+
+        let batch = int_batch((0..20_000).map(Some).collect());
+        let result = eval(&expr, &batch);
+        let false_positives = (0..20_000)
+            .filter(|k| {
+                assert!(k % 2 != 0 || result[*k as usize], "build key {k} dropped");
+                k % 2 != 0 && result[*k as usize]
+            })
+            .count();
+        assert!(false_positives < 500, "{false_positives} false positives");
+        assert!(expr.filter_bytes() > 0);
+        assert_eq!(pool.reserved(), expr.filter_bytes());
+        drop(expr);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    /// The filter does not keep the build keys alive: once the join released
+    /// them, a first evaluation keeps every row and reserves no memory.
+    #[test]
+    fn lazy_filter_without_build_keys_keeps_every_row() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let keys = int_keys(vec![1, 2, 3]);
+        let expr = lazy_int_expr(&keys, &pool);
+        drop(keys);
+        let batch = int_batch(vec![Some(1), Some(100)]);
+        assert_eq!(eval(&expr, &batch), vec![true, true]);
+        assert_eq!(pool.reserved(), 0);
+    }
+
     /// The filter memory is charged to the pool and released on drop.
     #[test]
     fn memory_is_reserved_and_released() {
         let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
         let expr = int_expr_with(vec![(0..100_000).collect()], OPTIONS, &pool).unwrap();
-        let built = &expr.filter.as_ref().unwrap().filter;
+        let built = &expr.filter.as_ref().unwrap().get().unwrap().filter;
         assert_eq!(pool.reserved(), built.num_blocks() * 32);
         drop(expr);
         assert_eq!(pool.reserved(), 0);

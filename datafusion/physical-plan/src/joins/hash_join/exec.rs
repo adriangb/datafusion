@@ -18,7 +18,6 @@ use crate::filter_pushdown::{
 };
 use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
-use crate::joins::hash_join::bloom_filter;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::not_in::{NotIn, NotInBuild};
 use crate::joins::hash_join::shared_bounds::{
@@ -59,7 +58,6 @@ use crate::{
     },
     metrics::{ExecutionPlanMetricsSet, MetricsSet},
 };
-use parquet::bloom_filter::Sbbf;
 
 use arrow::array::{Array, ArrayData, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
@@ -254,9 +252,6 @@ struct JoinBuildData {
     bounds: Option<PartitionBounds>,
     /// IN-list values or a hash-table reference used for filter pushdown.
     membership: PushdownStrategy,
-    /// Bloom filter of the build keys, for the global dynamic filter. `None`
-    /// when no bloom filter is possible for this build.
-    bloom_filter: Option<Arc<Sbbf>>,
     // Keep the reservation after the allocations it accounts for.
     reservation: MemoryReservation,
 }
@@ -322,11 +317,6 @@ impl JoinLeftData {
     /// returns a reference to the InList values for filter pushdown
     pub(super) fn membership(&self) -> &PushdownStrategy {
         &self.build.membership
-    }
-
-    /// Bloom filter of the build keys, for the dynamic filter.
-    pub(super) fn bloom_filter(&self) -> Option<&Arc<Sbbf>> {
-        self.build.bloom_filter.as_ref()
     }
 
     /// Borrow bounds without sharing a consuming join's dynamic-filter state.
@@ -3214,7 +3204,7 @@ fn build_in_memory(
     not_in: Option<NotIn>,
     array_map_created_count: &Count,
     prepared: bool,
-    num_build_partitions: usize,
+    _num_build_partitions: usize,
 ) -> Result<JoinLeftData> {
     let is_phj_candidate = is_perfect_hash_join_candidate(on_left, schema)?;
 
@@ -3414,29 +3404,6 @@ fn build_in_memory(
         bounds = None;
     }
 
-    // Fill the bloom filter of this partition's keys here, in its build task,
-    // so the finalizing task only ORs the partition filters. Partitions hold
-    // disjoint keys of similar counts, so the filter is sized for the keys of
-    // all partitions estimated from this one.
-    let bloom_filter = if !should_compute_dynamic_filters
-        || matches!(membership, PushdownStrategy::Empty)
-        || left_values.is_empty()
-    {
-        None
-    } else {
-        let filter = bloom_filter::partition_filter(
-            &left_values,
-            map.num_of_distinct_key()
-                .saturating_mul(num_build_partitions),
-            GlobalFilterOptions::new(config).bloom_filter,
-            &reservation,
-        )?;
-        if let Some(filter) = &filter {
-            metrics.build_mem_used.add(filter.num_blocks() * 32);
-        }
-        filter.map(Arc::new)
-    };
-
     if prepared {
         batches.clear();
         // Prepared keys are direct columns. IN-list arrays share these batch
@@ -3457,7 +3424,6 @@ fn build_in_memory(
             values: normalized_values,
             bounds,
             membership,
-            bloom_filter,
             reservation,
         }),
         not_in,
@@ -3695,7 +3661,9 @@ mod tests {
     fn bloom_filter_bytes(expr: &Arc<dyn PhysicalExpr>) -> Result<usize> {
         let mut bytes = 0;
         expr.apply(|e| {
-            if let Some(bloom) = e.downcast_ref::<bloom_filter::BloomFilterExpr>() {
+            if let Some(bloom) =
+                e.downcast_ref::<super::super::bloom_filter::BloomFilterExpr>()
+            {
                 bytes += bloom.filter_bytes();
             }
             Ok(TreeNodeRecursion::Continue)
